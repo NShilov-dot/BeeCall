@@ -1,0 +1,57 @@
+# Local Asterisk 22 (built from source with chan_websocket) for testing the
+# Dograh ARI integration end-to-end.
+#
+# Bring up alongside the main stack:
+#     docker compose -f docker-compose-local.yaml up -d
+#     docker compose -f docker-compose-asterisk.yaml up -d
+#
+# Asterisk joins beecall-network so it can resolve `api` by name. The api
+# container reaches Asterisk at http://asterisk:8088 for ARI, and Asterisk
+# reaches the api at ws://api:8000/api/v1/telephony/ws/ari for external media.
+#
+# On the host, SIP and RTP ports are published so a softphone (Zoiper /
+# Linphone) running on the same Mac can register to 6001@<host-ip>:5060.
+
+services:
+  asterisk:
+    image: dograh/asterisk:22-local
+    build:
+      context: ./config/asterisk
+      dockerfile: Dockerfile
+    container_name: dograh-asterisk
+    # SIP/RTP on the host loopback are enough for softphones on this Mac.
+    # If you want to register a hardware phone or another machine, change
+    # 127.0.0.1 to 0.0.0.0 — and remember to set
+    # external_signaling_address / external_media_address in pjsip.conf.
+    ports:
+      - "127.0.0.1:5060:5060/udp"
+      - "127.0.0.1:5060:5060/tcp"
+      - "127.0.0.1:8088:8088/tcp"
+      - "127.0.0.1:10000-10100:10000-10100/udp"
+    volumes:
+      - ./config/asterisk/conf:/etc/asterisk:ro
+      - asterisk_lib:/var/lib/asterisk
+      - asterisk_spool:/var/spool/asterisk
+      - asterisk_log:/var/log/asterisk
+    healthcheck:
+      # `core show version` exits 0 only when Asterisk is fully up.
+      test: ["CMD-SHELL", "asterisk -rx 'core show version' >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - beecall-network
+
+volumes:
+  asterisk_lib:
+  asterisk_spool:
+  asterisk_log:
+
+networks:
+  beecall-network:
+    # Re-use the bridge created by docker-compose-local.yaml. `external: true`
+    # means this compose file won't try to create / own it.
+    name: beecall-network
+    external: true

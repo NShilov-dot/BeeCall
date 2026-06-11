@@ -1,0 +1,147 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - beecall-network
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    command: >
+      --requirepass redissecret
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redissecret", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+    networks:
+      - beecall-network
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
+    ports:
+      - "127.0.0.1:9000:9000" # Bind to localhost explicitly
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - beecall-network
+
+  api:
+    image: ${REGISTRY:-dograhai}/dograh-api:latest
+    environment:
+      ENVIRONMENT: "${ENVIRONMENT:-local}"
+      LOG_LEVEL: "${LOG_LEVEL:-DEBUG}"
+      # URL the api advertises for itself (used in callback links, embed
+      # snippets, etc.). Browsers reach it via the host port mapping below.
+      BACKEND_API_ENDPOINT: "${BACKEND_API_ENDPOINT:-http://localhost:8000}"
+
+      # Infra — service names resolve inside beecall-network.
+      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/postgres"
+      REDIS_URL: "redis://:redissecret@redis:6379"
+
+      # MinIO — internal endpoint for the api, public endpoint for the browser.
+      ENABLE_AWS_S3: "false"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      MINIO_BUCKET: "voice-audio"
+      MINIO_SECURE: "false"
+
+      # Number of uvicorn worker processes and arq workers (start_services_docker.sh
+      # spawns FASTAPI_WORKERS uvicorns and ARQ_WORKERS arq processes).
+      FASTAPI_WORKERS: "${FASTAPI_WORKERS:-1}"
+      ARQ_WORKERS: "${ARQ_WORKERS:-1}"
+
+      OSS_JWT_SECRET: "${OSS_JWT_SECRET:-ChangeMeInLocalDev}"
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-false}"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'python -c "import urllib.request; urllib.request.urlopen(''http://localhost:8000/api/v1/health'').read()"',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - beecall-network
+
+  ui:
+    image: ${REGISTRY:-dograhai}/dograh-ui:latest
+    environment:
+      # api is in this compose now — reach it via the service name.
+      BACKEND_URL: "${BACKEND_URL:-http://api:8000}"
+      NODE_ENV: "oss"
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-false}"
+    ports:
+      - "3010:3010"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:3010 || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - beecall-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+
+networks:
+  beecall-network:
+    # Explicit name — no project prefix. Lets sibling compose files or one-off
+    # `docker run --network beecall-network ...` join the same bridge.
+    name: beecall-network
+    driver: bridge

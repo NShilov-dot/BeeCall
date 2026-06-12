@@ -103,8 +103,13 @@ class ARIBridgeSwapStrategy(TransferStrategy):
                 f"destination={destination_channel_id}, ext_media={ext_channel_id}"
             )
 
-            # 3. Set transfer state to prevent StasisEnd auto-teardown
+            # 3. Set transfer state to prevent StasisEnd auto-teardown and
+            #    record the destination leg so the eventual full teardown can
+            #    hang it up together with the rest of the call.
             workflow_run.gathered_context["transfer_state"] = "in-progress"
+            workflow_run.gathered_context["destination_channel_id"] = (
+                destination_channel_id
+            )
             await db_client.update_workflow_run(
                 run_id=int(workflow_run_id),
                 gathered_context=workflow_run.gathered_context,
@@ -168,9 +173,19 @@ class ARIBridgeSwapStrategy(TransferStrategy):
                 f"caller {channel_id} connected to destination {destination_channel_id} via bridge {bridge_id}"
             )
 
-            # 5. Clean up transfer context after successful completion
+            # 5. Map the destination leg to this run so its StasisEnd triggers
+            #    the same full teardown as the caller's, and drop the
+            #    transfer-channel marker — left in place, the destination's
+            #    eventual ChannelDestroyed would be published as TRANSFER_FAILED
+            #    even though the transfer succeeded.
+            await redis.set(
+                f"ari:channel:{destination_channel_id}", workflow_run_id, ex=3600
+            )
+            await call_transfer_manager.remove_transfer_channel_mapping(
+                destination_channel_id
+            )
 
-            call_transfer_manager = await get_call_transfer_manager()
+            # 6. Clean up transfer context after successful completion
             await call_transfer_manager.remove_transfer_context(
                 transfer_context.transfer_id
             )

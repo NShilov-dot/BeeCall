@@ -16,7 +16,7 @@ import json
 import signal
 import uuid
 from typing import Dict, Optional, Set
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import aiohttp
 import redis.asyncio as aioredis
@@ -62,6 +62,10 @@ class ARIConnection:
 
         self._ws: Optional[websockets.ClientConnection] = None
         self._task: Optional[asyncio.Task] = None
+        # Strong refs to in-flight event handler tasks: the event loop keeps
+        # only weak references, so an unreferenced task can be garbage
+        # collected mid-execution.
+        self._event_tasks: Set[asyncio.Task] = set()
         self._running = False
         self._reconnect_delay = 1  # Start with 1 second
         self._max_reconnect_delay = 300  # Max 300 seconds
@@ -153,13 +157,21 @@ class ARIConnection:
 
     @property
     def ws_url(self) -> str:
-        """Build the ARI WebSocket URL."""
+        """Build the ARI WebSocket URL.
+
+        The credentials travel in the query string and Asterisk URI-decodes
+        query params, so app name and password are percent-encoded — a
+        password containing ``&``, ``#``, ``%``, ``+`` or ``:`` would
+        otherwise corrupt the query string or the api_key split.
+        """
         parsed = urlparse(self.ari_endpoint)
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+        app = quote(self.app_name, safe="")
+        password = quote(self.app_password, safe="")
         return (
             f"{ws_scheme}://{parsed.netloc}/ari/events"
-            f"?api_key={self.app_name}:{self.app_password}"
-            f"&app={self.app_name}"
+            f"?api_key={app}:{password}"
+            f"&app={app}"
             f"&subscribeAll=true"
         )
 
@@ -167,6 +179,13 @@ class ARIConnection:
     def connection_key(self) -> str:
         """Unique key for this connection — one per ARI config row."""
         return f"config:{self.telephony_configuration_id}"
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """create_task with a strong reference held until the task finishes."""
+        task = asyncio.create_task(coro)
+        self._event_tasks.add(task)
+        task.add_done_callback(self._event_tasks.discard)
+        return task
 
     async def start(self):
         """Start the WebSocket connection in a background task."""
@@ -189,6 +208,13 @@ class ARIConnection:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        # Let in-flight event handlers finish — they're short REST calls, and
+        # cancelling mid-call would strand half-set-up channels. Anything
+        # still running after the grace period gets cancelled.
+        if self._event_tasks:
+            _, pending = await asyncio.wait(set(self._event_tasks), timeout=5)
+            for task in pending:
+                task.cancel()
         logger.info(
             f"[ARI org={self.organization_id}] Stopped connection to {self.ari_endpoint}"
         )
@@ -296,7 +322,7 @@ class ARIConnection:
                     f"entered Stasis — completing bridge for caller "
                     f"{pending['caller_channel_id']} (run {pending['workflow_run_id']})"
                 )
-                asyncio.create_task(
+                self._spawn(
                     self._complete_bridge_after_ext_ready(channel_id, pending)
                 )
                 return
@@ -310,51 +336,58 @@ class ARIConnection:
                 f"args={app_args}"
             )
 
-            if channel_state == "Ring":
-                # Inbound call — arrived from outside, not yet answered
-                asyncio.create_task(
+            # Route on appArgs, not channel state: channels we originate always
+            # carry args (workflow context or the transfer marker), while
+            # inbound calls come from the dialplan's bare Stasis(app) with no
+            # args. State is unreliable — a dialplan that runs Answer() before
+            # Stasis() delivers inbound channels already in state "Up".
+
+            # Transfer destination channel (app_args == ["transfer", id]).
+            # Transfer destinations run externally - we only track status to
+            # publish transfer event, not run the pipeline.
+            transfer_id = self._get_transfer_id(app_args)
+            if transfer_id:
+                logger.info(
+                    f"[ARI org={self.organization_id}] Transfer destination answered: "
+                    f"channel={channel_id}, transfer_id={transfer_id}"
+                )
+                self._spawn(
+                    self._handle_destination_answered(transfer_id, channel_id)
+                )
+                return
+
+            if not app_args:
+                # Inbound call — handed over by the dialplan
+                self._spawn(
                     self._handle_inbound_stasis_start(channel_id, channel_state, event)
                 )
-            else:
-                # Outbound call (state == "Up") — originated by us
-                # Check if this is a transfer destination channel (app_args starts with "transfer")
-                # Transfer destinations run externally - we only track status to publish transfer event, not run the pipeline
-                transfer_id = self._get_transfer_id(app_args)
-                if transfer_id:
-                    logger.info(
-                        f"[ARI org={self.organization_id}] Transfer destination answered: "
-                        f"channel={channel_id}, transfer_id={transfer_id}"
-                    )
-                    asyncio.create_task(
-                        self._handle_destination_answered(transfer_id, channel_id)
-                    )
-                    return
+                return
 
-                # Parse args to extract workflow context
-                args_dict = {}
-                for arg in app_args:
-                    for pair in arg.split(","):
-                        if "=" in pair:
-                            key, value = pair.split("=", 1)
-                            args_dict[key.strip()] = value.strip()
+            # Outbound call originated by us — parse args to extract workflow context
+            args_dict = {}
+            for arg in app_args:
+                for pair in arg.split(","):
+                    if "=" in pair:
+                        key, value = pair.split("=", 1)
+                        args_dict[key.strip()] = value.strip()
 
-                workflow_run_id = args_dict.get("workflow_run_id")
-                workflow_id = args_dict.get("workflow_id")
-                user_id = args_dict.get("user_id")
+            workflow_run_id = args_dict.get("workflow_run_id")
+            workflow_id = args_dict.get("workflow_id")
+            user_id = args_dict.get("user_id")
 
-                if not workflow_run_id or not workflow_id or not user_id:
-                    logger.warning(
-                        f"[ARI org={self.organization_id}] StasisStart missing required args: "
-                        f"workflow_run_id={workflow_run_id}, workflow_id={workflow_id}, user_id={user_id}"
-                    )
-                    return
-
-                # Start pipeline connection in background task
-                asyncio.create_task(
-                    self._handle_stasis_start(
-                        channel_id, channel_state, workflow_run_id, workflow_id, user_id
-                    )
+            if not workflow_run_id or not workflow_id or not user_id:
+                logger.warning(
+                    f"[ARI org={self.organization_id}] StasisStart missing required args: "
+                    f"workflow_run_id={workflow_run_id}, workflow_id={workflow_id}, user_id={user_id}"
                 )
+                return
+
+            # Start pipeline connection in background task
+            self._spawn(
+                self._handle_stasis_start(
+                    channel_id, channel_state, workflow_run_id, workflow_id, user_id
+                )
+            )
 
         elif event_type == "StasisEnd":
             logger.info(
@@ -362,9 +395,7 @@ class ARIConnection:
             )
             workflow_run_id = await self._get_channel_run(channel_id)
             if workflow_run_id:
-                asyncio.create_task(
-                    self._handle_stasis_end(channel_id, workflow_run_id)
-                )
+                self._spawn(self._handle_stasis_end(channel_id, workflow_run_id))
 
         elif event_type == "ChannelStateChange":
             logger.debug(
@@ -387,7 +418,7 @@ class ARIConnection:
                 failure_message = self._map_hangup_cause_to_message(
                     cause, tech_cause, cause_txt
                 )
-                asyncio.create_task(
+                self._spawn(
                     self._handle_transfer_failed(
                         transfer_id, channel_id, failure_message
                     )
@@ -675,6 +706,7 @@ class ARIConnection:
                     f"[ARI org={self.organization_id}] Failed to create external "
                     f"media for {channel_id} (ext_channel_id={ext_channel_id})"
                 )
+                await self._abort_call_setup(channel_id)
                 return
             if created_id != ext_channel_id:
                 # Asterisk ignored our channelId — pending state is stale and
@@ -685,6 +717,7 @@ class ARIConnection:
                     f"id {created_id} but we requested {ext_channel_id}; "
                     f"channelId may not be honored on this ARI version"
                 )
+                await self._abort_call_setup(channel_id, created_id)
                 return
 
             logger.info(
@@ -698,6 +731,7 @@ class ARIConnection:
                 f"[ARI org={self.organization_id}] Error handling StasisStart "
                 f"for channel {channel_id}: {e}"
             )
+            await self._abort_call_setup(channel_id)
 
     async def _complete_bridge_after_ext_ready(
         self, ext_channel_id: str, pending: dict
@@ -720,6 +754,7 @@ class ARIConnection:
                     f"[ARI org={self.organization_id}] Failed to bridge "
                     f"channels {caller_channel_id} <-> {ext_channel_id}"
                 )
+                await self._abort_call_setup(caller_channel_id, ext_channel_id)
                 return
             await db_client.update_workflow_run(
                 run_id=int(workflow_run_id),
@@ -733,6 +768,29 @@ class ARIConnection:
                 f"[ARI org={self.organization_id}] Error completing bridge for "
                 f"caller {caller_channel_id} / ext {ext_channel_id}: {e}"
             )
+            await self._abort_call_setup(caller_channel_id, ext_channel_id)
+
+    async def _abort_call_setup(
+        self, caller_channel_id: str, ext_channel_id: Optional[str] = None
+    ):
+        """Hang up the call legs after a failed setup step.
+
+        The caller has typically been answered by this point — without an
+        explicit hangup they would sit in dead air until they give up. The
+        caller's StasisEnd then runs the normal teardown, which clears the
+        Redis markers; deleting the ext leg here as well covers the case
+        where that event never arrives.
+        """
+        for cid in (caller_channel_id, ext_channel_id):
+            if not cid:
+                continue
+            try:
+                await self._delete_channel(cid)
+            except Exception as e:
+                logger.warning(
+                    f"[ARI org={self.organization_id}] Failed to hang up "
+                    f"channel {cid} while aborting call setup: {e}"
+                )
 
     async def _handle_stasis_end(self, channel_id: str, workflow_run_id: str):
         """Full teardown of all ARI resources on any channel's StasisEnd.
@@ -754,6 +812,7 @@ class ARIConnection:
             ctx = workflow_run.gathered_context
             call_id = ctx.get("call_id")
             ext_channel_id = ctx.get("ext_channel_id")
+            destination_channel_id = ctx.get("destination_channel_id")
             bridge_id = ctx.get("bridge_id")
             transfer_state = ctx.get("transfer_state")
 
@@ -791,24 +850,31 @@ class ARIConnection:
             if bridge_id:
                 await self._delete_bridge(bridge_id)
 
-            # Destroy both channels, skipping the one that already ended
-            for cid in (call_id, ext_channel_id):
+            # Destroy the remaining call legs, skipping the one that already
+            # ended. After a completed transfer the bridge also holds the
+            # destination leg — without hanging it up here the transferee is
+            # left in dead air when the caller hangs up.
+            for cid in (call_id, ext_channel_id, destination_channel_id):
                 if cid and cid != channel_id:
                     await self._delete_channel(cid)
 
             # Clean up all Redis reverse-mapping keys
             keys_to_delete = [
-                cid for cid in (call_id, ext_channel_id, channel_id) if cid
+                cid
+                for cid in (call_id, ext_channel_id, destination_channel_id, channel_id)
+                if cid
             ]
             if keys_to_delete:
                 await self._delete_channel_run(*keys_to_delete)
 
             # Clean up the Redis marker for external channel
-            await self._delete_ext_channel(ext_channel_id)
+            if ext_channel_id:
+                await self._delete_ext_channel(ext_channel_id)
 
             logger.info(
                 f"[ARI org={self.organization_id}] StasisEnd full teardown for "
-                f"channel={channel_id}, call={call_id}, ext={ext_channel_id}, bridge={bridge_id}"
+                f"channel={channel_id}, call={call_id}, ext={ext_channel_id}, "
+                f"dest={destination_channel_id}, bridge={bridge_id}"
             )
         except Exception as e:
             logger.error(

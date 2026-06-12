@@ -20,6 +20,7 @@ def _config_loader(value: Dict[str, Any]) -> Dict[str, Any]:
         "ari_endpoint": value.get("ari_endpoint"),
         "app_name": value.get("app_name"),
         "app_password": value.get("app_password"),
+        "trunk_name": value.get("trunk_name", ""),
         "from_numbers": value.get("from_numbers", []),
     }
 
@@ -51,6 +52,19 @@ _UI_METADATA = ProviderUIMetadata(
             label="websocket_client.conf Name",
             type="text",
             description="websocket_client.conf connection name for externalMedia",
+        ),
+        ProviderUIField(
+            name="trunk_name",
+            label="Outbound Trunk",
+            type="text",
+            required=False,
+            placeholder="beeline",
+            description=(
+                "PJSIP endpoint of the outbound SIP trunk — bare numbers dial "
+                "as PJSIP/<number>@<trunk>. Leave empty to dial bare numbers "
+                "as local endpoints; full PJSIP/SIP dial strings always pass "
+                "through unchanged."
+            ),
         ),
         ProviderUIField(
             name="from_numbers",

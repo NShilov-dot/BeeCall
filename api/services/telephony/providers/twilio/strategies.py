@@ -105,31 +105,12 @@ class TwilioConferenceStrategy(TransferStrategy):
 
     async def _find_transfer_context_for_call(self, call_sid: str):
         """Find the active transfer context for this call."""
-        try:
-            import redis.asyncio as aioredis
+        from api.services.telephony.call_transfer_manager import (
+            get_call_transfer_manager,
+        )
 
-            from api.constants import REDIS_URL
-            from api.services.telephony.transfer_event_protocol import TransferContext
-
-            # Search Redis for transfer contexts where original_call_sid matches
-            redis = aioredis.from_url(REDIS_URL, decode_responses=True)
-            transfer_keys = await redis.keys("transfer:context:*")
-
-            for key in transfer_keys:
-                try:
-                    context_data = await redis.get(key)
-                    if context_data:
-                        context = TransferContext.from_json(context_data)
-                        if context.original_call_sid == call_sid:
-                            return context
-                except Exception:
-                    continue
-
-            return None
-
-        except Exception as e:
-            logger.error(f"[Twilio Transfer] Error finding transfer context: {e}")
-            return None
+        manager = await get_call_transfer_manager()
+        return await manager.find_transfer_context_for_call(call_sid)
 
     async def _cleanup_transfer_context(self, transfer_id: str):
         """Clean up transfer context after completion or failure."""

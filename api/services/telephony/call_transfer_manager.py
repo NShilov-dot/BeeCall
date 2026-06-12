@@ -47,6 +47,15 @@ class CallTransferManager:
             redis = await self._get_redis()
             key = TransferRedisChannels.transfer_context_key(context.transfer_id)
             await redis.setex(key, ttl, context.to_json())
+            # Index by caller so lookups are a direct GET, not a keyspace scan.
+            if context.original_call_sid:
+                await redis.setex(
+                    TransferRedisChannels.transfer_by_caller_key(
+                        context.original_call_sid
+                    ),
+                    ttl,
+                    context.transfer_id,
+                )
             logger.debug(f"Stored transfer context for {context.transfer_id}")
         except Exception as e:
             logger.error(f"Failed to store transfer context: {e}")
@@ -72,7 +81,7 @@ class CallTransferManager:
             return None
 
     async def remove_transfer_context(self, transfer_id: str) -> None:
-        """Remove transfer context from Redis.
+        """Remove transfer context and its by-caller index entry from Redis.
 
         Args:
             transfer_id: Transfer identifier
@@ -80,7 +89,23 @@ class CallTransferManager:
         try:
             redis = await self._get_redis()
             key = TransferRedisChannels.transfer_context_key(transfer_id)
+            context_data = await redis.get(key)
             await redis.delete(key)
+
+            if context_data:
+                try:
+                    context = TransferContext.from_json(context_data)
+                except Exception:
+                    context = None
+                if context and context.original_call_sid:
+                    by_caller_key = TransferRedisChannels.transfer_by_caller_key(
+                        context.original_call_sid
+                    )
+                    # Drop the index only if it still points at this transfer —
+                    # a newer transfer for the same caller may have overwritten it.
+                    if await redis.get(by_caller_key) == transfer_id:
+                        await redis.delete(by_caller_key)
+
             logger.debug(f"Removed transfer context for {transfer_id}")
         except Exception as e:
             logger.error(f"Failed to remove transfer context: {e}")
@@ -105,6 +130,26 @@ class CallTransferManager:
         except Exception as e:
             logger.error(
                 f"[Transfer Manager] Error storing transfer channel mapping: {e}"
+            )
+
+    async def remove_transfer_channel_mapping(self, channel_id: str) -> None:
+        """Remove the channel->transfer mapping once the transfer resolves.
+
+        Left in place, the mapping makes the destination channel's eventual
+        ChannelDestroyed look like a failed transfer.
+
+        Args:
+            channel_id: ARI channel ID
+        """
+        try:
+            redis = await self._get_redis()
+            await redis.delete(f"ari:transfer_channel:{channel_id}")
+            logger.debug(
+                f"[Transfer Manager] Removed channel mapping for channel={channel_id}"
+            )
+        except Exception as e:
+            logger.error(
+                f"[Transfer Manager] Error removing transfer channel mapping: {e}"
             )
 
     async def publish_transfer_event(self, event: TransferEvent) -> None:
@@ -185,29 +230,30 @@ class CallTransferManager:
             except Exception as e:
                 logger.error(f"Error closing pubsub connection: {e}")
 
-    async def find_transfer_context_for_call(self, caller_channel_id: str):
-        """Find the active transfer context for this caller channel."""
+    async def find_transfer_context_for_call(
+        self, caller_call_id: str
+    ) -> Optional[TransferContext]:
+        """Find the active transfer context for this caller's call id.
 
-        redis = await self._get_redis()
+        Resolves via the by-caller index written by ``store_transfer_context``
+        — a direct GET instead of a blocking KEYS scan over the keyspace.
 
+        Args:
+            caller_call_id: Provider call id of the caller leg
+                (``original_call_sid`` of the stored context).
+        """
         try:
-            # Search Redis for transfer contexts where original_call_sid matches this caller
-            transfer_keys = await redis.keys("transfer:context:*")
-
-            for key in transfer_keys:
-                try:
-                    context_data = await redis.get(key)
-                    if context_data:
-                        context = TransferContext.from_json(context_data)
-                        if context.original_call_sid == caller_channel_id:
-                            return context
-                except Exception:
-                    continue
-
-            return None
-
+            redis = await self._get_redis()
+            transfer_id = await redis.get(
+                TransferRedisChannels.transfer_by_caller_key(caller_call_id)
+            )
+            if not transfer_id:
+                return None
+            return await self.get_transfer_context(transfer_id)
         except Exception as e:
-            logger.error(f"[ARI Transfer] Error finding transfer context: {e}")
+            logger.error(
+                f"Error finding transfer context for call {caller_call_id}: {e}"
+            )
             return None
 
     async def cleanup(self):

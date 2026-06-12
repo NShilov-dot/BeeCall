@@ -6,8 +6,9 @@ The ARI WebSocket event listener runs as a separate process (ari_manager.py).
 """
 
 import json
+import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import aiohttp
 from fastapi import HTTPException
@@ -45,11 +46,13 @@ class ARIProvider(TelephonyProvider):
                 - ari_endpoint: ARI base URL (e.g., http://asterisk:8088)
                 - app_name: Stasis application name
                 - app_password: ARI user password
+                - trunk_name: PJSIP endpoint of the outbound SIP trunk (optional)
                 - from_numbers: List of SIP extensions/numbers (optional)
         """
         self.ari_endpoint = config.get("ari_endpoint", "").rstrip("/")
         self.app_name = config.get("app_name", "")
         self.app_password = config.get("app_password", "")
+        self.trunk_name = config.get("trunk_name", "")
         self.from_numbers = config.get("from_numbers", [])
 
         if isinstance(self.from_numbers, str):
@@ -60,6 +63,20 @@ class ARIProvider(TelephonyProvider):
     def _get_auth(self) -> aiohttp.BasicAuth:
         """Generate BasicAuth for ARI API requests."""
         return aiohttp.BasicAuth(self.app_name, self.app_password)
+
+    def _build_sip_endpoint(self, number: str) -> str:
+        """Build the dial string for an outbound number (call or transfer).
+
+        Full dial strings (``PJSIP/...`` / ``SIP/...``) pass through
+        unchanged. Bare numbers dial through the configured outbound trunk
+        (``PJSIP/<number>@<trunk_name>``); with no trunk configured they fall
+        back to ``PJSIP/<number>`` — a local endpoint of that name.
+        """
+        if number.startswith("SIP/") or number.startswith("PJSIP/"):
+            return number
+        if self.trunk_name:
+            return f"PJSIP/{number}@{self.trunk_name}"
+        return f"PJSIP/{number}"
 
     async def initiate_call(
         self,
@@ -81,13 +98,8 @@ class ARIProvider(TelephonyProvider):
 
         endpoint = f"{self.base_url}/channels"
 
-        # Build the SIP endpoint string
-        # to_number can be a SIP URI or extension
-        if to_number.startswith("SIP/") or to_number.startswith("PJSIP/"):
-            sip_endpoint = to_number
-        else:
-            # Default to PJSIP technology
-            sip_endpoint = f"PJSIP/{to_number}"
+        # to_number can be a full dial string, a bare number or an extension
+        sip_endpoint = self._build_sip_endpoint(to_number)
 
         # Prepare channel creation data
         params = {
@@ -405,14 +417,23 @@ class ARIProvider(TelephonyProvider):
         # Get call transfer manager for event correlation mapping
         call_transfer_manager = await get_call_transfer_manager()
 
-        # Build SIP endpoint
-        if destination.startswith("SIP/") or destination.startswith("PJSIP/"):
-            sip_endpoint = destination
-        else:
-            sip_endpoint = f"PJSIP/{destination}"
+        # Same routing rule as initiate_call: bare numbers go through the
+        # trunk, full dial strings (e.g. internal PJSIP/6001) pass through.
+        sip_endpoint = self._build_sip_endpoint(destination)
 
         # Build transfer appArgs for event correlation
         app_args = f"transfer,{transfer_id}"
+
+        # Pre-register the channel->transfer mapping under an id we choose,
+        # before the originate POST. A destination that dies instantly (bad
+        # endpoint) fires ChannelDestroyed before the POST response returns —
+        # registering after the fact would miss that event and the caller
+        # would wait out the full transfer timeout instead of getting the
+        # failure right away.
+        destination_channel_id = f"dograh-xfer-{uuid.uuid4()}"
+        await call_transfer_manager.store_transfer_channel_mapping(
+            destination_channel_id, transfer_id
+        )
 
         try:
             endpoint = f"{self.base_url}/channels"
@@ -421,6 +442,7 @@ class ARIProvider(TelephonyProvider):
                 "app": self.app_name,
                 "appArgs": app_args,
                 "timeout": timeout,  # Keep timeout for transfer calls
+                "channelId": destination_channel_id,
             }
 
             async with aiohttp.ClientSession() as session:
@@ -434,23 +456,26 @@ class ARIProvider(TelephonyProvider):
                     if response.status != 200:
                         error_msg = f"ARI channel creation failed: {response.status} {response_text}"
                         logger.error(f"[ARI Transfer] {error_msg}")
-                        await call_transfer_manager.remove_transfer_context(transfer_id)
                         raise Exception(error_msg)
 
                     result = json.loads(response_text)
 
-            destination_channel_id = result.get("id", "")
-            if not destination_channel_id:
+            actual_channel_id = result.get("id", "")
+            if not actual_channel_id:
                 logger.error(
                     f"[ARI Transfer] Failed to get channel ID from response: {result}"
                 )
-                await call_transfer_manager.remove_transfer_context(transfer_id)
                 raise Exception("Failed to create destination channel")
 
-            # Store transfer channel mapping for event correlation
-            await call_transfer_manager.store_transfer_channel_mapping(
-                destination_channel_id, transfer_id
-            )
+            if actual_channel_id != destination_channel_id:
+                # Asterisk ignored our channelId — re-map under the real id.
+                await call_transfer_manager.remove_transfer_channel_mapping(
+                    destination_channel_id
+                )
+                destination_channel_id = actual_channel_id
+                await call_transfer_manager.store_transfer_channel_mapping(
+                    destination_channel_id, transfer_id
+                )
 
             logger.info(
                 f"[ARI Transfer] Originated destination channel {destination_channel_id} "
@@ -467,6 +492,9 @@ class ARIProvider(TelephonyProvider):
         except Exception as e:
             logger.error(
                 f"[ARI Transfer] Failed to originate call transfer destination channel: {e}"
+            )
+            await call_transfer_manager.remove_transfer_channel_mapping(
+                destination_channel_id
             )
             await call_transfer_manager.remove_transfer_context(transfer_id)
             raise
@@ -517,12 +545,18 @@ class ARIProvider(TelephonyProvider):
             return False
 
     def get_ws_url(self) -> str:
-        """Get the ARI WebSocket URL for event listening."""
+        """Get the ARI WebSocket URL for event listening.
+
+        Credentials are percent-encoded for the query string — see
+        ``ARIConnection.ws_url`` in ``ari_manager.py``.
+        """
         parsed = urlparse(self.ari_endpoint)
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+        app = quote(self.app_name, safe="")
+        password = quote(self.app_password, safe="")
         return (
             f"{ws_scheme}://{parsed.netloc}/ari/events"
-            f"?api_key={self.app_name}:{self.app_password}"
-            f"&app={self.app_name}"
+            f"?api_key={app}:{password}"
+            f"&app={app}"
             f"&subscribeAll=true"
         )

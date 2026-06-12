@@ -35,7 +35,8 @@ BUILD_ARGS := $(if $(INSECURE),--build-arg INSECURE_BUILD=1,)
         up up-local down down-local \
         restart restart-local rebuild rebuild-local \
         pull pull-local \
-        logs logs-local ps ps-local clean
+        logs logs-local ps ps-local clean \
+        test test-api test-api-unit test-api-ari test-ui test-env-setup
 
 help:
 	@echo "Container management targets:"
@@ -67,6 +68,15 @@ help:
 	@echo ""
 	@echo "  Maintain:"
 	@echo "    clean         Prune stopped containers and dangling images"
+	@echo ""
+	@echo "  Tests:"
+	@echo "    test          Run api + ui test suites"
+	@echo "    test-api      Run all api pytests against the *_test database"
+	@echo "    test-api-unit Run api unit tests only (excludes -m slow)"
+	@echo "    test-api-ari  Run api/tests/telephony/ari/ (ARI provider tests)"
+	@echo "    test-ui       Run ui test scripts"
+	@echo "    test-env-setup  Copy api/.env.test.example -> api/.env.test if missing"
+	@echo "                    PYTEST_ARGS=-k name  to filter (api targets)"
 	@echo ""
 	@echo "  Variables (override on command line):"
 	@echo "    REGISTRY=$(REGISTRY)  TAG=$(TAG)"
@@ -121,3 +131,59 @@ logs-local:
 clean:
 	docker container prune -f
 	docker image prune -f
+
+# ---------------------------------------------------------------------------
+# Tests
+#
+# Conventions:
+#   * api tests run pytest from the repo root with the venv activated and
+#     api/.env.test sourced — api/conftest.py reads DATABASE_URL/REDIS_URL at
+#     import time, so the env file must exist before pytest starts.
+#   * test-env-setup creates api/.env.test from the committed example if it's
+#     missing (the actual file is gitignored — per-developer).
+#   * PYTEST_ARGS lets you pass through extra flags or -k filters, e.g.
+#     `make test-api PYTEST_ARGS="-k extraction -x"`.
+#   * Tests that need postgres/redis assume the local docker stack is up
+#     (`make up-local`). Pure-unit tests don't, but the conftest still loads
+#     env vars at import.
+# ---------------------------------------------------------------------------
+
+VENV_PY    := venv/bin/python
+PYTEST_ARGS ?=
+
+# Sources api/.env.test into the subshell that runs pytest. `set -a` exports
+# every var defined while sourcing, then `set +a` stops auto-export so the
+# rest of the command isn't polluted.
+define run_pytest
+	@if [ ! -f venv/bin/activate ]; then \
+		echo "venv/ not found — run scripts/setup_local.sh first."; exit 1; \
+	fi
+	@$(MAKE) --no-print-directory test-env-setup
+	@set -a && . api/.env.test && set +a && \
+		$(VENV_PY) -m pytest $(1) $(PYTEST_ARGS)
+endef
+
+test: test-api test-ui
+
+test-env-setup:
+	@if [ ! -f api/.env.test ]; then \
+		cp api/.env.test.example api/.env.test; \
+		echo "Created api/.env.test from api/.env.test.example. Edit if your"; \
+		echo "local postgres/redis bind on non-default ports."; \
+	fi
+
+test-api:
+	$(call run_pytest,api/tests)
+
+test-api-unit:
+	$(call run_pytest,api/tests -m "not slow")
+
+test-api-ari:
+	$(call run_pytest,api/tests/telephony/ari)
+
+test-ui:
+	@if [ ! -d ui/node_modules ]; then \
+		echo "ui/node_modules not found — running npm ci first…"; \
+		cd ui && npm ci; \
+	fi
+	cd ui && npm test --if-present

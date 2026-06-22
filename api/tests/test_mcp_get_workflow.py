@@ -16,6 +16,7 @@ def authed_user() -> MagicMock:
 def _workflow() -> SimpleNamespace:
     return SimpleNamespace(
         id=7,
+        organization_id=1,
         name="Support Agent",
         status="active",
         released_definition=SimpleNamespace(

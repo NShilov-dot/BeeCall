@@ -10,6 +10,7 @@ import { EdgeChange, NodeChange } from "@xyflow/system";
 import { useRouter } from "next/navigation";
 import posthog from "posthog-js";
 import { useCallback, useEffect, useRef } from "react";
+import { toast } from "sonner";
 
 import { useWorkflowStore } from "@/app/workflow/[workflowId]/stores/workflowStore";
 import {
@@ -332,6 +333,14 @@ export const useWorkflowState = ({
                     applyWorkflowErrors(workflowErrors);
                 }
                 logger.error(`Error saving workflow: ${JSON.stringify(response.error)}`);
+                // isDirty is intentionally left true (the save did not persist).
+                // Surface the failure so the lingering "Unsaved changes" badge
+                // isn't mistaken for a no-op save.
+                toast.error(
+                    workflowErrors.length > 0
+                        ? "Couldn't save — fix the highlighted errors and try again."
+                        : "Couldn't save your changes. They're still unsaved — please try again.",
+                );
             } else {
                 setIsDirty(false);
                 if (response.data) {
@@ -353,6 +362,7 @@ export const useWorkflowState = ({
             }
         } catch (error) {
             logger.error(`Error saving workflow: ${error}`);
+            toast.error("Couldn't save your changes. They're still unsaved — please try again.");
         }
 
         // Only run validate after a successful save — when save failed we've

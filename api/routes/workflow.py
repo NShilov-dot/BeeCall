@@ -940,7 +940,11 @@ async def update_workflow(
                 existing_def = (
                     existing_draft.workflow_json
                     if existing_draft
-                    else existing_workflow.released_definition.workflow_json
+                    else (
+                        existing_workflow.released_definition.workflow_json
+                        if existing_workflow.released_definition
+                        else {}
+                    )
                 )
                 workflow_definition = merge_workflow_api_keys(
                     workflow_definition,
@@ -1007,10 +1011,19 @@ async def update_workflow(
             workflow_configs = draft.workflow_configurations
             template_vars = draft.template_context_variables
         else:
+            # A normally-created workflow always has a published V1, but legacy
+            # or partially-migrated rows can have released_definition == None
+            # (released_definition_id is nullable). Guard the dereference so a
+            # save doesn't 500 — which would leave the editor stuck on
+            # "Unsaved changes".
             published = workflow.released_definition
-            workflow_def = published.workflow_json
-            workflow_configs = published.workflow_configurations
-            template_vars = published.template_context_variables
+            workflow_def = published.workflow_json if published else {}
+            workflow_configs = (
+                published.workflow_configurations if published else None
+            )
+            template_vars = (
+                published.template_context_variables if published else None
+            )
 
         # Include version info from the active definition (draft or published)
         active_def = draft or workflow.released_definition

@@ -629,6 +629,7 @@ class WorkflowClient(BaseDBClient):
         if has_versioned_changes:
             await self.save_workflow_draft(
                 workflow_id=workflow_id,
+                organization_id=organization_id,
                 workflow_definition=workflow_definition,
                 workflow_configurations=workflow_configurations,
                 template_context_variables=template_context_variables,

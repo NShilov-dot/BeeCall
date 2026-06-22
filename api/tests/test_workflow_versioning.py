@@ -231,6 +231,68 @@ class TestSaveDraft:
 
 
 # ---------------------------------------------------------------------------
+# update_workflow -> save_workflow_draft wiring (regression)
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateWorkflowSavesDraft:
+    """Regression: WorkflowClient.update_workflow must forward organization_id
+    to save_workflow_draft.
+
+    save_workflow_draft requires organization_id (no default). A versioned
+    update that forgets to pass it raises TypeError, which the route turns into
+    HTTP 500 — and the editor's "Unsaved changes" badge never clears because the
+    frontend only resets it on a 2xx. These tests exercise the full
+    update_workflow -> save_workflow_draft path so the wiring can't regress.
+    """
+
+    async def test_definition_change_persists_draft(
+        self, db_session, workflow_with_v1
+    ):
+        workflow, user = workflow_with_v1
+
+        # Must not raise — a missing organization_id would surface as TypeError.
+        await db_session.update_workflow(
+            workflow_id=workflow.id,
+            name=None,
+            workflow_definition=GRAPH_V2,
+            template_context_variables=None,
+            workflow_configurations=None,
+            organization_id=workflow.organization_id,
+        )
+
+        versions = await db_session.get_workflow_versions(
+            workflow.id, organization_id=workflow.organization_id
+        )
+        statuses = {v.version_number: v.status for v in versions}
+        assert statuses == {1: "published", 2: "draft"}
+        draft = next(v for v in versions if v.status == "draft")
+        assert draft.workflow_json == GRAPH_V2
+
+    async def test_config_only_change_persists_draft(
+        self, db_session, workflow_with_v1
+    ):
+        # A config-only edit is still a versioned change and routes through the
+        # same save_workflow_draft path that crashed without org scoping.
+        workflow, user = workflow_with_v1
+
+        await db_session.update_workflow(
+            workflow_id=workflow.id,
+            name=None,
+            workflow_definition=None,
+            template_context_variables=None,
+            workflow_configurations=CONFIG_V2,
+            organization_id=workflow.organization_id,
+        )
+
+        versions = await db_session.get_workflow_versions(
+            workflow.id, organization_id=workflow.organization_id
+        )
+        draft = next(v for v in versions if v.status == "draft")
+        assert draft.workflow_configurations == CONFIG_V2
+
+
+# ---------------------------------------------------------------------------
 # Publishing a draft
 # ---------------------------------------------------------------------------
 

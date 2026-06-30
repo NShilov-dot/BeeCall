@@ -12,15 +12,17 @@ left as ``None``.
 
 from api.services.configuration.registry import (
     DeepgramSTTConfiguration,
+    DeepSeekLLMConfiguration,
     ElevenlabsTTSConfiguration,
     OpenAIEmbeddingsConfiguration,
-    OpenAILLMService,
     ServiceProviders,
 )
 
 # Mapping of service to (provider enum, configuration class)
+# First-version default stack: DeepSeek (Russian-capable, OpenAI-compatible so we
+# can later repoint base_url at our own GPU cluster) + Deepgram STT (ru) + ElevenLabs.
 _DEFAULTS = {
-    "llm": (ServiceProviders.OPENAI, OpenAILLMService),
+    "llm": (ServiceProviders.DEEPSEEK, DeepSeekLLMConfiguration),
     "tts": (ServiceProviders.ELEVENLABS, ElevenlabsTTSConfiguration),
     "stt": (ServiceProviders.DEEPGRAM, DeepgramSTTConfiguration),
     "embeddings": (ServiceProviders.OPENAI, OpenAIEmbeddingsConfiguration),

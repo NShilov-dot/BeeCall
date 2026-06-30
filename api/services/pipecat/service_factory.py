@@ -23,6 +23,7 @@ from pipecat.services.deepgram.flux.stt import (
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
 from pipecat.services.deepgram.tts import DeepgramTTSService, DeepgramTTSSettings
 from pipecat.services.beecall.llm import BeeCallLLMService
+from pipecat.services.deepseek.llm import DeepSeekLLMService
 from pipecat.services.dograh.llm import DograhLLMService
 from pipecat.services.dograh.stt import DograhSTTService, DograhSTTSettings
 from pipecat.services.dograh.tts import DograhTTSService, DograhTTSSettings
@@ -589,6 +590,17 @@ def create_llm_service_from_provider(
                 temperature=temperature if temperature is not None else 1.0,
             ),
         )
+    elif provider == ServiceProviders.DEEPSEEK.value:
+        # base_url defaults to DeepSeek's API; repoint it (via config) to a
+        # self-hosted vLLM / GPU-cluster endpoint to migrate with no code change.
+        return DeepSeekLLMService(
+            api_key=api_key,
+            base_url=base_url or "https://api.deepseek.com/v1",
+            settings=DeepSeekLLMService.Settings(
+                model=model,
+                temperature=temperature if temperature is not None else 0.1,
+            ),
+        )
     else:
         raise HTTPException(status_code=400, detail=f"Invalid LLM provider {provider}")
 
@@ -740,6 +752,8 @@ def create_llm_service(user_config):
         kwargs["base_url"] = user_config.llm.base_url
         kwargs["temperature"] = user_config.llm.temperature
     elif provider == ServiceProviders.BEECALL.value:
+        kwargs["base_url"] = user_config.llm.base_url
+    elif provider == ServiceProviders.DEEPSEEK.value:
         kwargs["base_url"] = user_config.llm.base_url
 
     return create_llm_service_from_provider(provider, model, api_key, **kwargs)

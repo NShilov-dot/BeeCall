@@ -56,10 +56,12 @@ class ServiceProviders(str, Enum):
     CAMB = "camb"
     AWS_BEDROCK = "aws_bedrock"
     SPEACHES = "speaches"
+    PIPER = "piper"
     ASSEMBLYAI = "assemblyai"
     GLADIA = "gladia"
     RIME = "rime"
     MINIMAX = "minimax"
+    DEEPSEEK = "deepseek"
     GOOGLE_VERTEX = "google_vertex"
     OPENAI_REALTIME = "openai_realtime"
     GROK_REALTIME = "grok_realtime"
@@ -81,10 +83,12 @@ class BaseServiceConfiguration(BaseModel):
         ServiceProviders.BEECALL,
         ServiceProviders.AWS_BEDROCK,
         ServiceProviders.SPEACHES,
+        ServiceProviders.PIPER,
         ServiceProviders.ASSEMBLYAI,
         ServiceProviders.GLADIA,
         ServiceProviders.RIME,
         ServiceProviders.MINIMAX,
+        ServiceProviders.DEEPSEEK,
         ServiceProviders.GOOGLE_VERTEX,
         ServiceProviders.OPENAI_REALTIME,
         ServiceProviders.GROK_REALTIME,
@@ -223,6 +227,15 @@ BEECALL_PROVIDER_MODEL_CONFIG = provider_model_config(
     ),
 )
 AWS_BEDROCK_PROVIDER_MODEL_CONFIG = provider_model_config("AWS Bedrock")
+DEEPSEEK_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "DeepSeek",
+    description=(
+        "DeepSeek's OpenAI-compatible chat API. Strong Russian; "
+        "'deepseek-chat' (V3) is the low-latency default for voice. Repoint "
+        "base_url to your self-hosted GPU cluster to migrate without code changes."
+    ),
+    provider_docs_url="https://api-docs.deepseek.com/",
+)
 GOOGLE_VERTEX_PROVIDER_MODEL_CONFIG = provider_model_config("Google Vertex")
 OPENAI_REALTIME_PROVIDER_MODEL_CONFIG = provider_model_config("OpenAI Realtime")
 GROK_REALTIME_PROVIDER_MODEL_CONFIG = provider_model_config("Grok Realtime")
@@ -248,6 +261,15 @@ SPEACHES_PROVIDER_MODEL_CONFIG = provider_model_config(
         "for setup and supported backends."
     ),
     provider_docs_url="https://github.com/speaches-ai/speaches",
+)
+PIPER_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Piper (local TTS)",
+    description=(
+        "Self-hosted Piper neural TTS, run in-process. The voice model is "
+        "downloaded from the rhasspy/piper-voices catalog on first use. Good "
+        "fit for telephony (fast, runs on CPU); pick a -low or -medium voice."
+    ),
+    provider_docs_url="https://github.com/OHF-Voice/piper1-gpl",
 )
 
 OPENAI_MODELS = [
@@ -508,6 +530,31 @@ class MiniMaxLLMConfiguration(BaseLLMConfiguration):
     )
 
 
+DEEPSEEK_MODELS = ["deepseek-chat", "deepseek-reasoner"]
+
+
+@register_llm
+class DeepSeekLLMConfiguration(BaseLLMConfiguration):
+    model_config = DEEPSEEK_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.DEEPSEEK] = ServiceProviders.DEEPSEEK
+    model: str = Field(
+        default="deepseek-chat",
+        description=(
+            "DeepSeek chat model. 'deepseek-chat' (V3) is the low-latency default "
+            "for voice; 'deepseek-reasoner' (R1) adds thinking latency."
+        ),
+        json_schema_extra={"examples": DEEPSEEK_MODELS, "allow_custom_input": True},
+    )
+    base_url: str = Field(
+        default="https://api.deepseek.com/v1",
+        description=(
+            "OpenAI-compatible base URL — must point at the /v1 root, not at "
+            "/v1/chat/completions. Repoint to your self-hosted vLLM / GPU-cluster "
+            "endpoint to migrate off DeepSeek with no code change."
+        ),
+    )
+
+
 OPENAI_REALTIME_MODELS = ["gpt-realtime-2"]
 OPENAI_REALTIME_VOICES = [
     "alloy",
@@ -698,6 +745,7 @@ LLMConfig = Annotated[
         AWSBedrockLLMConfiguration,
         SpeachesLLMConfiguration,
         MiniMaxLLMConfiguration,
+        DeepSeekLLMConfiguration,
     ],
     Field(discriminator="provider"),
 ]
@@ -989,6 +1037,51 @@ class SpeachesTTSConfiguration(BaseTTSConfiguration):
     )
 
 
+# A few voices from the rhasspy/piper-voices catalog. Russian is available
+# today; verify Uzbek (uz_*) against the catalog before relying on it — if it
+# is absent, train a Piper voice on your own data.
+PIPER_TTS_VOICES = [
+    "ru_RU-irina-medium",
+    "ru_RU-dmitri-medium",
+    "ru_RU-ruslan-medium",
+]
+
+
+@register_tts
+class PiperTTSConfiguration(BaseTTSConfiguration):
+    model_config = PIPER_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.PIPER] = ServiceProviders.PIPER
+    # Piper has no separate "model" concept — the voice file is the model.
+    # The field exists only to satisfy BaseTTSConfiguration; the service
+    # ignores it and loads by `voice`.
+    model: str = Field(
+        default="piper",
+        description="Unused by Piper; kept for config-shape compatibility.",
+    )
+    voice: str = Field(
+        default="ru_RU-irina-medium",
+        description=(
+            "Piper voice id from the rhasspy/piper-voices catalog "
+            "(e.g. ru_RU-irina-medium). Prefer -low or -medium for telephony."
+        ),
+        json_schema_extra={
+            "examples": PIPER_TTS_VOICES,
+            "allow_custom_input": True,
+        },
+    )
+    speed: float = Field(
+        default=1.0, ge=0.25, le=4.0, description="Speech speed (0.25 to 4.0)."
+    )
+    use_cuda: bool = Field(
+        default=False,
+        description="Run inference on GPU. Leave off for local/CPU dev.",
+    )
+    api_key: str | list[str] | None = Field(
+        default=None,
+        description="Not used by Piper (runs in-process). Leave blank.",
+    )
+
+
 MINIMAX_TTS_MODELS = ["speech-2.8-hd", "speech-2.8-turbo"]
 MINIMAX_TTS_VOICES = [
     "English_Graceful_Lady",
@@ -1042,6 +1135,7 @@ TTSConfig = Annotated[
         CambTTSConfiguration,
         RimeTTSConfiguration,
         SpeachesTTSConfiguration,
+        PiperTTSConfiguration,
         MiniMaxTTSConfiguration,
     ],
     Field(discriminator="provider"),
@@ -1060,7 +1154,7 @@ class DeepgramSTTConfiguration(BaseSTTConfiguration):
         json_schema_extra={"examples": DEEPGRAM_STT_MODELS},
     )
     language: str = Field(
-        default="multi",
+        default="ru",
         description="Language code; 'multi' enables auto-detect (Nova-3 only).",
         json_schema_extra={
             "examples": DEEPGRAM_LANGUAGES,
@@ -1113,7 +1207,7 @@ class GoogleSTTConfiguration(BaseSTTConfiguration):
         },
     )
     language: str = Field(
-        default="en-US",
+        default="ru-RU",
         description="Primary BCP-47 language code for recognition.",
         json_schema_extra={
             "examples": GOOGLE_STT_LANGUAGES,

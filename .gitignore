@@ -17,6 +17,7 @@ venv/
 coturn/
 *.wav
 dograh_pcm_cache/
+piper_voices/
 node_modules/
 .vscode
 

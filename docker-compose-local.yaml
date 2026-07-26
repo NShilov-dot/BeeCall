@@ -85,6 +85,14 @@ services:
       FASTAPI_WORKERS: "${FASTAPI_WORKERS:-1}"
       ARQ_WORKERS: "${ARQ_WORKERS:-1}"
 
+      # Seed keys for a new user's default stack (DeepSeek LLM + Deepgram STT +
+      # Piper TTS). Piper needs no key; a missing key leaves that service unset
+      # for the user to fill in under Model Configurations. Put the values in a
+      # .env file next to this compose file or export them in your shell.
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      DEEPGRAM_API_KEY: "${DEEPGRAM_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+
       OSS_JWT_SECRET: "${OSS_JWT_SECRET:-ChangeMeInLocalDev}"
       ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-false}"
     ports:
@@ -125,7 +133,10 @@ services:
       test:
         [
           "CMD-SHELL",
-          "wget --no-verbose --tries=1 --spider http://localhost:3010 || exit 1",
+          # 127.0.0.1, not localhost: busybox wget resolves localhost to ::1
+          # first and the Next.js server binds IPv4 only, so the check fails
+          # with "Connection refused" while the UI is perfectly up.
+          "wget --no-verbose --tries=1 --spider http://127.0.0.1:3010 || exit 1",
         ]
       interval: 30s
       timeout: 10s

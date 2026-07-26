@@ -6,11 +6,16 @@
 #   chains; the resulting runtime image still runs with the default secure
 #   posture. Pass via Makefile (`make build INSECURE=1`) or directly
 #   (`docker build --build-arg INSECURE_BUILD=1 ...`).
+#
+#   PIPER_VOICES: comma-separated Piper voice ids baked into the image for the
+#   default in-process TTS (default: ru_RU-irina-medium). ~63 MB per voice.
 ARG INSECURE_BUILD=0
+ARG PIPER_VOICES=ru_RU-irina-medium
 
 # Stage 1: Builder - Install Python dependencies
 FROM python:3.12-slim AS builder
 ARG INSECURE_BUILD
+ARG PIPER_VOICES
 
 WORKDIR /app
 
@@ -37,7 +42,7 @@ RUN pip install --user --no-cache-dir -r requirements.txt && \
 
 # Copy and install pipecat from local submodule
 COPY pipecat /tmp/pipecat
-RUN pip install --user --no-cache-dir '/tmp/pipecat[cartesia,deepgram,openai,elevenlabs,groq,google,azure,sarvam,soundfile,silero,webrtc,speechmatics,openrouter,camb,mcp]' && \
+RUN pip install --user --no-cache-dir '/tmp/pipecat[cartesia,deepgram,openai,elevenlabs,groq,google,azure,sarvam,soundfile,silero,webrtc,speechmatics,openrouter,camb,piper,mcp]' && \
     # Swap opencv-python (pulled by pipecat[webrtc]) for opencv-python-headless
     # to drop X11/Qt dependencies that otherwise require libxcb etc. in runner.
     pip uninstall -y opencv-python && \
@@ -49,6 +54,16 @@ RUN pip install --user --no-cache-dir '/tmp/pipecat[cartesia,deepgram,openai,ele
 ctx = ssl._create_unverified_context() if os.environ.get('INSECURE_BUILD') == '1' else None;\
 ssl._create_default_https_context = (lambda: ctx) if ctx else ssl._create_default_https_context;\
 nltk.download('punkt_tab', quiet=True)" && \
+    # Pre-download Piper voices (default TTS, runs in-process). Baked in at build
+    # time because the runtime network can't be assumed to reach huggingface.
+    # Same urllib/SSL relaxation as NLTK above for intercepting proxies.
+    INSECURE_BUILD="$INSECURE_BUILD" PIPER_VOICES="$PIPER_VOICES" python -c "import os, ssl;\
+from pathlib import Path;\
+from piper.download_voices import download_voice;\
+ctx = ssl._create_unverified_context() if os.environ.get('INSECURE_BUILD') == '1' else None;\
+ssl._create_default_https_context = (lambda: ctx) if ctx else ssl._create_default_https_context;\
+d = Path('/piper_voices'); d.mkdir(parents=True, exist_ok=True);\
+[download_voice(v, d) for v in os.environ.get('PIPER_VOICES', 'ru_RU-irina-medium').split(',') if v]" && \
     # Clean up pip cache and temporary pipecat directory
     rm -rf /root/.cache/pip /tmp/pipecat
 
@@ -68,18 +83,14 @@ COPY api/mcp_server/ts_validator/package*.json ./
 RUN if [ "$INSECURE_BUILD" = "1" ]; then npm config set strict-ssl false; fi && \
     npm ci --omit=dev && npm cache clean --force
 
-# Stage 3: Static ffmpeg binary (avoids apt ffmpeg pulling mesa/libllvm for
-# hardware acceleration we don't use server-side).
-FROM debian:trixie-slim AS ffmpeg-static
-ARG INSECURE_BUILD
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates xz-utils \
-    && if [ "$INSECURE_BUILD" = "1" ]; then CURL_OPTS="-k"; else CURL_OPTS=""; fi \
-    && curl $CURL_OPTS -fsSL -o /tmp/ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
-    && mkdir -p /tmp/ffmpeg \
-    && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1 \
-    && mv /tmp/ffmpeg/ffmpeg /tmp/ffmpeg/ffprobe /usr/local/bin/ \
-    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+# Stage 3: Static ffmpeg + ffprobe (avoids apt ffmpeg, which pulls 200 packages
+# incl. mesa/libllvm for hardware acceleration we don't use server-side).
+#
+# Sourced from a multi-arch image rather than a tarball download: the previous
+# johnvansickle.com URL was amd64-only (so the image couldn't build on Apple
+# Silicon) and now answers HTTP 415. A registry pull also works behind proxies
+# that mangle plain HTTPS downloads.
+FROM mwader/static-ffmpeg:8.1.2 AS ffmpeg-static
 
 # Stage 4: Runtime - Minimal image with only runtime dependencies
 FROM python:3.12-slim AS runner
@@ -87,8 +98,8 @@ FROM python:3.12-slim AS runner
 WORKDIR /app
 
 # Static ffmpeg + ffprobe (used by audio_converter, audio_file_cache, etc.)
-COPY --from=ffmpeg-static /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
-COPY --from=ffmpeg-static /usr/local/bin/ffprobe /usr/local/bin/ffprobe
+COPY --from=ffmpeg-static /ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg-static /ffprobe /usr/local/bin/ffprobe
 
 # Node.js 22 binary only (ts_validator subprocess needs node >=22.6 for
 # native TypeScript stripping; see api/mcp_server/ts_bridge.py). python:3.12-slim
@@ -100,6 +111,10 @@ COPY --from=builder /root/.local /root/.local
 
 # Copy NLTK data (punkt_tab tokenizer) from builder stage
 COPY --from=builder /root/nltk_data /root/nltk_data
+
+# Piper voice models — resolved at runtime as APP_ROOT_DIR.parent / "piper_voices"
+# (see PIPER_VOICES_DIR in api/services/pipecat/service_factory.py).
+COPY --from=builder /piper_voices ./piper_voices
 
 # Make sure scripts in .local are available
 ENV PATH=/root/.local/bin:$PATH

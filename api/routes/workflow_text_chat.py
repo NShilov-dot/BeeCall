@@ -10,7 +10,7 @@ from api.db import db_client
 from api.db.models import UserModel, WorkflowRunTextSessionModel
 from api.enums import WorkflowRunMode
 from api.services.auth.depends import get_user
-from api.services.quota_service import check_dograh_quota
+from api.services.quota_service import check_quota
 from api.services.workflow.text_chat_session_service import (
     TextChatPendingTurnLostError,
     TextChatSessionExecutionError,
@@ -103,7 +103,7 @@ def _require_selected_organization_id(user: UserModel) -> int:
 
 
 async def _ensure_text_chat_quota(user: UserModel, workflow_id: int) -> None:
-    quota_result = await check_dograh_quota(user, workflow_id=workflow_id)
+    quota_result = await check_quota(user, workflow_id=workflow_id)
     if not quota_result.has_quota:
         raise HTTPException(status_code=402, detail=quota_result.error_message)
 

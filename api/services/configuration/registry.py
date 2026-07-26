@@ -49,7 +49,6 @@ class ServiceProviders(str, Enum):
     ELEVENLABS = "elevenlabs"
     GOOGLE = "google"
     AZURE = "azure"
-    DOGRAH = "dograh"
     BEECALL = "beecall"
     SARVAM = "sarvam"
     SPEECHMATICS = "speechmatics"
@@ -79,7 +78,6 @@ class BaseServiceConfiguration(BaseModel):
         ServiceProviders.ELEVENLABS,
         ServiceProviders.GOOGLE,
         ServiceProviders.AZURE,
-        ServiceProviders.DOGRAH,
         ServiceProviders.BEECALL,
         ServiceProviders.AWS_BEDROCK,
         ServiceProviders.SPEACHES,
@@ -217,7 +215,6 @@ GOOGLE_PROVIDER_MODEL_CONFIG = provider_model_config("Google")
 GROQ_PROVIDER_MODEL_CONFIG = provider_model_config("Groq")
 OPENROUTER_PROVIDER_MODEL_CONFIG = provider_model_config("Open Router")
 AZURE_OPENAI_PROVIDER_MODEL_CONFIG = provider_model_config("Azure OpenAI")
-DOGRAH_PROVIDER_MODEL_CONFIG = provider_model_config("Dograh")
 BEECALL_PROVIDER_MODEL_CONFIG = provider_model_config(
     "BeeCall",
     description=(
@@ -302,7 +299,6 @@ OPENROUTER_MODELS = [
     "deepseek/deepseek-chat-v3-0324",
 ]
 AZURE_MODELS = ["gpt-4.1-mini"]
-DOGRAH_LLM_MODELS = ["default", "accurate", "fast", "lite", "zen"]
 AWS_BEDROCK_MODELS = [
     "us.amazon.nova-pro-v1:0",
     "us.amazon.nova-lite-v1:0",
@@ -408,17 +404,6 @@ class AzureLLMService(BaseLLMConfiguration):
 
     endpoint: str = Field(
         description="Azure OpenAI resource endpoint (e.g. https://<resource>.openai.azure.com).",
-    )
-
-
-@register_llm
-class DograhLLMService(BaseLLMConfiguration):
-    model_config = DOGRAH_PROVIDER_MODEL_CONFIG
-    provider: Literal[ServiceProviders.DOGRAH] = ServiceProviders.DOGRAH
-    model: str = Field(
-        default="default",
-        description="Dograh-hosted model tier.",
-        json_schema_extra={"examples": DOGRAH_LLM_MODELS, "allow_custom_input": True},
     )
 
 
@@ -740,7 +725,6 @@ LLMConfig = Annotated[
         OpenRouterLLMConfiguration,
         GoogleLLMService,
         AzureLLMService,
-        DograhLLMService,
         BeeCallLLMConfiguration,
         AWSBedrockLLMConfiguration,
         SpeachesLLMConfiguration,
@@ -888,25 +872,6 @@ class OpenAITTSService(BaseTTSConfiguration):
         default="alloy",
         description="OpenAI TTS voice name.",
     )
-
-
-DOGRAH_TTS_MODELS = ["default"]
-
-
-@register_tts
-class DograhTTSService(BaseTTSConfiguration):
-    model_config = DOGRAH_PROVIDER_MODEL_CONFIG
-    provider: Literal[ServiceProviders.DOGRAH] = ServiceProviders.DOGRAH
-    model: str = Field(
-        default="default",
-        description="Dograh TTS tier.",
-        json_schema_extra={"examples": DOGRAH_TTS_MODELS},
-    )
-    voice: str = Field(
-        default="default",
-        description="Voice preset.",
-    )
-    speed: float = Field(default=1.0, ge=0.5, le=2.0, description="Speed of the voice.")
 
 
 CARTESIA_TTS_MODELS = ["sonic-3"]
@@ -1069,9 +1034,8 @@ class PiperTTSConfiguration(BaseTTSConfiguration):
             "allow_custom_input": True,
         },
     )
-    speed: float = Field(
-        default=1.0, ge=0.25, le=4.0, description="Speech speed (0.25 to 4.0)."
-    )
+    # No `speed` field: pipecat's PiperTTSService only forwards voice/language
+    # (TTSSettings has no speed), so the knob would silently do nothing.
     use_cuda: bool = Field(
         default=False,
         description="Run inference on GPU. Leave off for local/CPU dev.",
@@ -1130,7 +1094,6 @@ TTSConfig = Annotated[
         OpenAITTSService,
         ElevenlabsTTSConfiguration,
         CartesiaTTSConfiguration,
-        DograhTTSService,
         SarvamTTSConfiguration,
         CambTTSConfiguration,
         RimeTTSConfiguration,
@@ -1230,27 +1193,6 @@ class GoogleSTTConfiguration(BaseSTTConfiguration):
     api_key: str | list[str] | None = Field(
         default=None,
         description="Not used for Google Cloud STT. Leave blank.",
-    )
-
-
-# Dograh STT Service
-DOGRAH_STT_MODELS = ["default"]
-DOGRAH_STT_LANGUAGES = DEEPGRAM_LANGUAGES
-
-
-@register_stt
-class DograhSTTService(BaseSTTConfiguration):
-    model_config = DOGRAH_PROVIDER_MODEL_CONFIG
-    provider: Literal[ServiceProviders.DOGRAH] = ServiceProviders.DOGRAH
-    model: str = Field(
-        default="default",
-        description="Dograh STT tier.",
-        json_schema_extra={"examples": DOGRAH_STT_MODELS},
-    )
-    language: str = Field(
-        default="multi",
-        description="Language code; use 'multi' for auto-detect.",
-        json_schema_extra={"examples": DOGRAH_STT_LANGUAGES},
     )
 
 
@@ -1364,7 +1306,6 @@ STTConfig = Annotated[
         CartesiaSTTConfiguration,
         OpenAISTTConfiguration,
         GoogleSTTConfiguration,
-        DograhSTTService,
         SpeechmaticsSTTConfiguration,
         SarvamSTTConfiguration,
         SpeachesSTTConfiguration,

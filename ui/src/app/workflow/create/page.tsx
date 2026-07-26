@@ -62,12 +62,16 @@ export default function CreateWorkflowPage() {
                 },
             });
 
-            if (response.data?.id) {
-                setWorkflowId(String(response.data.id));
-                setShowSuccessModal(true);
+            if (!response.data?.id) {
+                // The SDK client resolves (not throws) on non-2xx — surface the
+                // server's detail, e.g. "No LLM configured...", instead of nothing.
+                const detail = (response.error as { detail?: string } | undefined)?.detail;
+                throw new Error(detail || 'Failed to create workflow. Please try again.');
             }
+            setWorkflowId(String(response.data.id));
+            setShowSuccessModal(true);
         } catch (err) {
-            setError('Failed to create workflow. Please try again.');
+            setError(err instanceof Error ? err.message : 'Failed to create workflow. Please try again.');
             logger.error(`Error creating workflow: ${err}`);
         } finally {
             setIsLoading(false);

@@ -1081,7 +1081,7 @@ async def test_text_chat_session_creation_rejects_quota_before_creating_run(
 
     async with test_client_factory(user) as client:
         with patch(
-            "api.routes.workflow_text_chat.check_dograh_quota",
+            "api.routes.workflow_text_chat.check_quota",
             new=AsyncMock(
                 return_value=SimpleNamespace(
                     has_quota=False,
@@ -1144,7 +1144,7 @@ async def test_text_chat_append_rejects_quota_without_mutating_session(
     async with test_client_factory(user) as client:
         with (
             patch(
-                "api.routes.workflow_text_chat.check_dograh_quota",
+                "api.routes.workflow_text_chat.check_quota",
                 new=AsyncMock(
                     side_effect=[
                         SimpleNamespace(has_quota=True, error_message=""),

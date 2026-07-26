@@ -57,7 +57,7 @@ def test_trigger_route_executes_as_workflow_owner():
     with (
         patch("api.routes.public_agent.db_client") as mock_db,
         patch(
-            "api.routes.public_agent.check_dograh_quota_by_user_id",
+            "api.routes.public_agent.check_quota_by_user_id",
             new=quota_mock,
         ),
         patch(
@@ -124,7 +124,7 @@ def test_workflow_uuid_route_uses_scoped_lookup_and_shared_execution():
     with (
         patch("api.routes.public_agent.db_client") as mock_db,
         patch(
-            "api.routes.public_agent.check_dograh_quota_by_user_id",
+            "api.routes.public_agent.check_quota_by_user_id",
             new=quota_mock,
         ),
         patch(

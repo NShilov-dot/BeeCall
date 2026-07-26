@@ -11,7 +11,10 @@ services:
         max-size: "10m"
         max-file: "3"
     ports:
-      - "5432:5432"
+      # loopback only — the DB must never be reachable off-host. Containers
+      # reach it over app-network by service name; this mapping is just for
+      # host-local psql. (was "5432:5432" = every interface / public IP)
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -25,7 +28,7 @@ services:
   redis:
     image: redis:7
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379" # loopback only — never expose Redis off-host
     command: >
       --requirepass redissecret
     volumes:
@@ -173,10 +176,20 @@ services:
       TURN_SECRET: "${TURN_SECRET:-}"
       FORCE_TURN_RELAY: "${FORCE_TURN_RELAY:-false}"
 
-      OSS_JWT_SECRET: "${OSS_JWT_SECRET:-ChangeMeInProduction}"
+      # Seed keys for a new user's default stack (DeepSeek LLM + Deepgram STT +
+      # Piper TTS). Piper needs no key; a missing key leaves that service unset
+      # for the user to fill in under Model Configurations.
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      DEEPGRAM_API_KEY: "${DEEPGRAM_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+
+      # REQUIRED — no insecure default. Anyone who knows the signing key can
+      # forge a token for any account. setup_remote.sh generates one; for a
+      # manual deploy put OSS_JWT_SECRET=$(openssl rand -hex 32) in .env.
+      OSS_JWT_SECRET: "${OSS_JWT_SECRET:?set OSS_JWT_SECRET in .env — generate with: openssl rand -hex 32}"
 
       # Telemetry
-      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-true}"
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-false}"
       POSTHOG_API_KEY: "phc_ItizB1dP6yv7ZYobbcqrpxTdbomDA8hJFSEmAMdYvIr"
       POSTHOG_HOST: "https://us.i.posthog.com"
 
@@ -189,8 +202,6 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-      cloudflared:
-        condition: service_started
     healthcheck:
       test:
         [
@@ -211,7 +222,7 @@ services:
       BACKEND_URL: "${BACKEND_URL:-http://api:8000}"
       NODE_ENV: "oss"
       # Flag to enable/ disable posthog
-      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-true}"
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-false}"
 
       # Posthog
       POSTHOG_KEY: "phc_ItizB1dP6yv7ZYobbcqrpxTdbomDA8hJFSEmAMdYvIr"
@@ -225,7 +236,10 @@ services:
       test:
         [
           "CMD-SHELL",
-          "wget --no-verbose --tries=1 --spider http://localhost:3010 || exit 1",
+          # 127.0.0.1, not localhost: busybox wget resolves localhost to ::1
+          # first and the Next.js server binds IPv4 only, so the check fails
+          # with "Connection refused" while the UI is perfectly up.
+          "wget --no-verbose --tries=1 --spider http://127.0.0.1:3010 || exit 1",
         ]
       interval: 30s
       timeout: 10s
@@ -237,13 +251,64 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared-tunnel
+    # Opt-in only. This is an ANONYMOUS quick-tunnel that exposes the API on a
+    # random public *.trycloudflare.com URL, bypassing nginx/TLS and any IP
+    # allowlist. Start with `--profile cloudflare` only if you want that.
+    profiles: ["cloudflare"]
     command: tunnel --no-autoupdate --url http://api:8000 --metrics 0.0.0.0:2000
     ports:
       - "2000:2000" # Expose metrics endpoint
     networks:
       - app-network
 
+  # SIP telephony (Asterisk 22 + chan_websocket). Opt-in via `--profile
+  # telephony`. Softphones (Zoiper/Linphone) register here; the media leg
+  # streams to the api over app-network at ws://api:8000/.../ws/ari, and the
+  # api drives call control via ARI at http://asterisk:8088 — internal to
+  # app-network, deliberately NOT published to the host.
+  #
+  # Before first start on a prod host:
+  #   1) set external_media_address in config/asterisk/pjsip.prod.conf to this
+  #      host's public/routable IP (softphones need it for two-way audio),
+  #   2) create config/asterisk/conf/pjsip_trunks.conf with your softphone
+  #      endpoint(s) + a STRONG password (kept out of git),
+  #   3) lock 5060 + 10000-10100/udp to your testers' IPs at the host firewall.
+  asterisk:
+    image: dograh/asterisk:22-local
+    build:
+      context: ./config/asterisk
+      dockerfile: Dockerfile
+    container_name: dograh-asterisk
+    profiles: ["telephony"]
+    depends_on:
+      api:
+        condition: service_started
+    volumes:
+      - ./config/asterisk/conf:/etc/asterisk:ro
+      # prod pjsip overlay: binds 0.0.0.0, advertises the public IP, and ships
+      # no sample softphone (define real endpoints in pjsip_trunks.conf).
+      - ./config/asterisk/pjsip.prod.conf:/etc/asterisk/pjsip.conf:ro
+      - asterisk_lib:/var/lib/asterisk
+      - asterisk_spool:/var/spool/asterisk
+    ports:
+      # Lock these to your testers' IPs at the host firewall / cloud security
+      # group — do NOT leave SIP open to the whole internet.
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "10000-10100:10000-10100/udp"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "asterisk -rx 'core show version' >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks:
+      - app-network
+
 volumes:
+  asterisk_lib:
+  asterisk_spool:
   postgres_data:
   redis_data:
   minio-data:

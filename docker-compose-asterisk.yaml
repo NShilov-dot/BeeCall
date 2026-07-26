@@ -19,15 +19,16 @@ services:
       context: ./config/asterisk
       dockerfile: Dockerfile
     container_name: dograh-asterisk
-    # SIP/RTP on the host loopback are enough for softphones on this Mac.
-    # If you want to register a hardware phone or another machine, change
-    # 127.0.0.1 to 0.0.0.0 — and remember to set
-    # external_signaling_address / external_media_address in pjsip.conf.
+    # SIP/RTP are opened to the LAN so a softphone on another device (e.g. a
+    # phone on the same Wi-Fi) can register. This pairs with
+    # external_signaling_address / external_media_address in pjsip.conf so
+    # Asterisk advertises the Mac's LAN IP for RTP. 8088 (ARI) stays on
+    # loopback — only the api container needs it, over beecall-network.
     ports:
-      - "127.0.0.1:5060:5060/udp"
-      - "127.0.0.1:5060:5060/tcp"
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
       - "127.0.0.1:8088:8088/tcp"
-      - "127.0.0.1:10000-10100:10000-10100/udp"
+      - "10000-10100:10000-10100/udp"
     volumes:
       - ./config/asterisk/conf:/etc/asterisk:ro
       - asterisk_lib:/var/lib/asterisk

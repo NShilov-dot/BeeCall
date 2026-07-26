@@ -5,7 +5,8 @@ from api.db import db_client
 from api.db.models import UserModel
 from api.enums import PostHogEvent
 from api.schemas.auth import AuthResponse, LoginRequest, SignupRequest, UserResponse
-from api.services.auth.depends import create_user_configuration_with_mps_key, get_user
+from api.services.auth.depends import get_user
+from api.services.configuration.defaults import build_default_user_configuration
 from api.services.posthog_client import capture_event
 from api.utils.auth import create_jwt_token, hash_password, verify_password
 
@@ -40,16 +41,14 @@ async def signup(request: SignupRequest):
     await db_client.add_user_to_organization(user.id, organization.id)
     await db_client.update_user_selected_organization(user.id, organization.id)
 
-    # Create default service configuration
+    # Create default service configuration — our own stack, no cloud round-trip.
     try:
-        mps_config = await create_user_configuration_with_mps_key(
-            user.id, organization.id, user.provider_id
+        await db_client.update_user_configuration(
+            user.id, build_default_user_configuration()
         )
-        if mps_config:
-            await db_client.update_user_configuration(user.id, mps_config)
     except Exception:
         logger.warning(
-            "Failed to create default configuration for OSS user", exc_info=True
+            "Failed to create default configuration for new user", exc_info=True
         )
 
     # Create JWT token

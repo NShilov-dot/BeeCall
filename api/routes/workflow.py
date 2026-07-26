@@ -6,7 +6,6 @@ from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from httpx import HTTPStatusError
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
@@ -25,10 +24,14 @@ from api.services.configuration.masking import (
     merge_workflow_api_keys,
 )
 from api.services.configuration.resolve import resolve_effective_config
-from api.services.mps_service_key_client import mps_service_key_client
 from api.services.posthog_client import capture_event
 from api.services.reports import generate_workflow_report_csv
 from api.services.storage import storage_fs
+from api.services.workflow.agent_builder import (
+    AgentGenerationError,
+    LLMNotConfiguredError,
+    build_workflow_from_description,
+)
 from api.services.workflow.dto import ReactFlowDTO, sanitize_workflow_definition
 from api.services.workflow.duplicate import duplicate_workflow
 from api.services.workflow.errors import ItemKind, WorkflowError
@@ -422,9 +425,8 @@ async def create_workflow_from_template(
     Create a new workflow from a natural language template request.
 
     This endpoint:
-    1. Uses mps_service_key_client to call MPS workflow API
-    2. Passes organization ID (authenticated mode) or created_by (OSS mode)
-    3. Creates the workflow in the database
+    1. Generates the workflow with the organization's own configured LLM
+    2. Creates the workflow in the database
 
     Args:
         request: The template creation request with call_type, use_case, and activity_description
@@ -434,27 +436,18 @@ async def create_workflow_from_template(
         The created workflow
 
     Raises:
-        HTTPException: If MPS API call fails
+        HTTPException: If no LLM is configured (400) or generation fails (502)
     """
     try:
-        # Call MPS API to generate workflow using the client
-        if DEPLOYMENT_MODE == "oss":
-            workflow_data = await mps_service_key_client.call_workflow_api(
-                call_type=request.call_type.upper(),
-                use_case=request.use_case,
-                activity_description=request.activity_description,
-                created_by=str(user.provider_id),
-            )
-        else:
-            if not user.selected_organization_id:
-                raise HTTPException(status_code=400, detail="No organization selected")
+        if DEPLOYMENT_MODE != "oss" and not user.selected_organization_id:
+            raise HTTPException(status_code=400, detail="No organization selected")
 
-            workflow_data = await mps_service_key_client.call_workflow_api(
-                call_type=request.call_type.upper(),
-                use_case=request.use_case,
-                activity_description=request.activity_description,
-                organization_id=user.selected_organization_id,
-            )
+        workflow_data = await build_workflow_from_description(
+            user_id=user.id,
+            call_type=request.call_type.upper(),
+            use_case=request.use_case,
+            activity_description=request.activity_description,
+        )
 
         # Create the workflow in our database
         # Regenerate trigger UUIDs to avoid conflicts with existing triggers
@@ -512,12 +505,10 @@ async def create_workflow_from_template(
 
     except HTTPException:
         raise
-    except HTTPStatusError as e:
-        logger.error(f"MPS API error: {e}")
-        raise HTTPException(
-            status_code=e.response.status_code if hasattr(e, "response") else 500,
-            detail=str(e),
-        )
+    except LLMNotConfiguredError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except AgentGenerationError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error(f"Unexpected error creating workflow from template: {e}")
         raise HTTPException(

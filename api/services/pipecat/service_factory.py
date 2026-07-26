@@ -4,7 +4,7 @@ import aiohttp
 from fastapi import HTTPException
 from loguru import logger
 
-from api.constants import MPS_API_URL
+from api.constants import APP_ROOT_DIR
 from api.services.configuration.registry import ServiceProviders
 from api.services.pipecat.minimax_tts import MiniMaxOwnedSessionTTSService
 from pipecat.services.assemblyai.stt import AssemblyAISTTService, AssemblyAISTTSettings
@@ -24,9 +24,6 @@ from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSetting
 from pipecat.services.deepgram.tts import DeepgramTTSService, DeepgramTTSSettings
 from pipecat.services.beecall.llm import BeeCallLLMService
 from pipecat.services.deepseek.llm import DeepSeekLLMService
-from pipecat.services.dograh.llm import DograhLLMService
-from pipecat.services.dograh.stt import DograhSTTService, DograhSTTSettings
-from pipecat.services.dograh.tts import DograhTTSService, DograhTTSSettings
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
 from pipecat.services.gladia.stt import GladiaSTTService, GladiaSTTSettings
 from pipecat.services.google.llm import GoogleLLMService, GoogleLLMSettings
@@ -62,6 +59,12 @@ from pipecat.utils.text.xml_function_tag_filter import XMLFunctionTagFilter
 
 if TYPE_CHECKING:
     from api.services.pipecat.audio_config import AudioConfig
+
+
+# Piper voice models sit next to the app root (same convention as CACHE_DIR in
+# audio_file_cache.py) and are baked into the image at build time — the runtime
+# network can't be assumed to reach huggingface.
+PIPER_VOICES_DIR = APP_ROOT_DIR.parent / "piper_voices"
 
 
 def create_stt_service(
@@ -133,19 +136,6 @@ def create_stt_service(
     elif user_config.stt.provider == ServiceProviders.CARTESIA.value:
         return CartesiaSTTService(
             api_key=user_config.stt.api_key,
-            sample_rate=audio_config.transport_in_sample_rate,
-        )
-    elif user_config.stt.provider == ServiceProviders.DOGRAH.value:
-        base_url = MPS_API_URL.replace("http://", "ws://").replace("https://", "wss://")
-        language = getattr(user_config.stt, "language", None) or "multi"
-        return DograhSTTService(
-            base_url=base_url,
-            api_key=user_config.stt.api_key,
-            settings=DograhSTTSettings(
-                model=user_config.stt.model,
-                language=language,
-            ),
-            keyterms=keyterms,
             sample_rate=audio_config.transport_in_sample_rate,
         )
     elif user_config.stt.provider == ServiceProviders.SARVAM.value:
@@ -347,21 +337,6 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             skip_aggregator_types=["recording_router", "recording"],
             silence_time_s=1.0,
         )
-    elif user_config.tts.provider == ServiceProviders.DOGRAH.value:
-        # Convert HTTP URL to WebSocket URL for TTS
-        base_url = MPS_API_URL.replace("http://", "ws://").replace("https://", "wss://")
-        return DograhTTSService(
-            base_url=base_url,
-            api_key=user_config.tts.api_key,
-            settings=DograhTTSSettings(
-                model=user_config.tts.model,
-                voice=user_config.tts.voice,
-                speed=user_config.tts.speed,
-            ),
-            text_filters=[xml_function_tag_filter],
-            skip_aggregator_types=["recording_router", "recording"],
-            silence_time_s=1.0,
-        )
     elif user_config.tts.provider == ServiceProviders.CAMB.value:
         from pipecat.services.camb.tts import CambTTSService
 
@@ -386,6 +361,29 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
                 voice=user_config.tts.voice,
                 speed=user_config.tts.speed,
             ),
+            text_filters=[xml_function_tag_filter],
+            skip_aggregator_types=["recording_router", "recording"],
+            silence_time_s=1.0,
+        )
+    elif user_config.tts.provider == ServiceProviders.PIPER.value:
+        # Imported lazily for the same reason as CAMB above: pipecat's Piper
+        # module raises at import time when the optional `piper-tts` dependency
+        # is absent, and this module is imported by everything.
+        from pipecat.services.piper.tts import PiperTTSService, PiperTTSSettings
+
+        # Only relevant outside Docker, where the voice isn't baked in and piper
+        # downloads it on first use. download_dir stays a Path: pipecat hands it
+        # to piper's download_voice, which does `download_dir / f"{voice}.onnx"`.
+        PIPER_VOICES_DIR.mkdir(parents=True, exist_ok=True)
+        # ponytail: PiperVoice.load costs ~600 ms and ~140 MB of RSS, runs
+        # synchronously here, and create_tts_service is called once per call
+        # (run_pipeline.py) — so a starting call stalls the worker's event loop
+        # for ~0.6 s. Fine for a handful of concurrent calls; if it bites, cache
+        # the voice per (voice, use_cuda) in the pipecat fork that loads it.
+        return PiperTTSService(
+            download_dir=PIPER_VOICES_DIR,
+            use_cuda=getattr(user_config.tts, "use_cuda", False),
+            settings=PiperTTSSettings(voice=user_config.tts.voice),
             text_filters=[xml_function_tag_filter],
             skip_aggregator_types=["recording_router", "recording"],
             silence_time_s=1.0,
@@ -549,12 +547,6 @@ def create_llm_service_from_provider(
             api_key=api_key,
             endpoint=endpoint,
             settings=AzureLLMSettings(model=model, temperature=0.1),
-        )
-    elif provider == ServiceProviders.DOGRAH.value:
-        return DograhLLMService(
-            base_url=f"{MPS_API_URL}/api/v1/llm",
-            api_key=api_key,
-            settings=OpenAILLMSettings(model=model),
         )
     elif provider == ServiceProviders.BEECALL.value:
         # base_url is required: see create_llm_service() which extracts it

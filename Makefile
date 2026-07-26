@@ -29,10 +29,17 @@ SERVICE ?=
 # corporate MITM proxy. The resulting runtime image still runs with the
 # default secure posture; this only affects the build stage.
 INSECURE ?=
-BUILD_ARGS := $(if $(INSECURE),--build-arg INSECURE_BUILD=1,)
 
-.PHONY: help build build-api build-ui \
-        up up-local down down-local \
+# PIPER_VOICES overrides which Piper voices are baked into the api image for the
+# default in-process TTS — comma-separated ids from the rhasspy/piper-voices
+# catalog, ~63 MB each. Empty means the Dockerfile default (ru_RU-irina-medium).
+PIPER_VOICES ?=
+
+BUILD_ARGS := $(if $(INSECURE),--build-arg INSECURE_BUILD=1,) \
+              $(if $(PIPER_VOICES),--build-arg PIPER_VOICES=$(PIPER_VOICES),)
+
+.PHONY: help build build-api build-ui build-asterisk \
+        up up-local up-asterisk down down-local down-asterisk logs-asterisk \
         restart restart-local rebuild rebuild-local \
         pull pull-local \
         logs logs-local ps ps-local clean \
@@ -60,6 +67,12 @@ help:
 	@echo "    rebuild-local build + restart-local     (refresh after code changes)"
 	@echo "    pull-local    Pull latest images for local stack from registry"
 	@echo ""
+	@echo "  Run — Asterisk for telephony tests (opt-in, separate compose file):"
+	@echo "    build-asterisk  Build Asterisk 22 + chan_websocket from source (slow)"
+	@echo "    up-asterisk     Start Asterisk (brings up the local stack first)"
+	@echo "    down-asterisk   Stop Asterisk"
+	@echo "    logs-asterisk   Tail Asterisk logs"
+	@echo ""
 	@echo "  Inspect:"
 	@echo "    ps            List production containers"
 	@echo "    ps-local      List local dev containers"
@@ -81,6 +94,8 @@ help:
 	@echo "  Variables (override on command line):"
 	@echo "    REGISTRY=$(REGISTRY)  TAG=$(TAG)"
 	@echo "    INSECURE=1  Disable TLS in build (corporate MITM proxy workaround)"
+	@echo "    PIPER_VOICES=ru_RU-irina-medium,ru_RU-dmitri-medium"
+	@echo "                Piper voices baked into the api image (~63 MB each)"
 
 build: build-api build-ui
 
@@ -95,6 +110,25 @@ up:
 
 up-local:
 	docker compose -f docker-compose-local.yaml up -d
+
+# Asterisk stays opt-in: its image is built from source (20+ min) and it
+# publishes SIP/RTP host ports, so it has no place in the default local stack.
+# Its compose file declares beecall-network as `external: true` — it joins the
+# bridge the local stack creates — hence the up-local prerequisite.
+build-asterisk:
+	docker compose -f docker-compose-asterisk.yaml build
+
+up-asterisk: up-local
+	docker compose -f docker-compose-asterisk.yaml up -d
+
+# Both compose files share the project name (the directory), so compose calls
+# the local-stack containers "orphans" here and suggests --remove-orphans.
+# Never add that flag: it would delete the whole local stack.
+down-asterisk:
+	docker compose -f docker-compose-asterisk.yaml down
+
+logs-asterisk:
+	docker compose -f docker-compose-asterisk.yaml logs -f
 
 down:
 	docker compose down

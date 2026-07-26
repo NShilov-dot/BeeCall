@@ -70,12 +70,14 @@ export function CreateWorkflowButton() {
                 },
             });
 
-            if (response.data?.id) {
-                router.push(`/workflow/${response.data.id}`);
+            if (!response.data?.id) {
+                const detail = (response.error as { detail?: string } | undefined)?.detail;
+                throw new Error(detail || 'Failed to create workflow');
             }
+            router.push(`/workflow/${response.data.id}`);
         } catch (err) {
             logger.error(`Error creating blank workflow: ${err}`);
-            toast.error('Failed to create workflow');
+            toast.error(err instanceof Error ? err.message : 'Failed to create workflow');
         } finally {
             setIsCreating(false);
         }

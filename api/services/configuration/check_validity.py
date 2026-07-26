@@ -12,7 +12,6 @@ from api.schemas.user_configuration import (
     UserConfiguration,
 )
 from api.services.configuration.registry import ServiceConfig, ServiceProviders
-from api.services.mps_service_key_client import mps_service_key_client
 
 AuthContext = TypedDict(
     "AuthContext",
@@ -41,7 +40,6 @@ class UserConfigurationValidator:
             ServiceProviders.GOOGLE.value: self._check_google_api_key,
             ServiceProviders.AZURE.value: self._check_azure_api_key,
             ServiceProviders.CARTESIA.value: self._check_cartesia_api_key,
-            ServiceProviders.DOGRAH.value: self._check_dograh_api_key,
             ServiceProviders.SARVAM.value: self._check_sarvam_api_key,
             ServiceProviders.SPEECHMATICS.value: self._check_speechmatics_api_key,
             ServiceProviders.CAMB.value: self._check_camb_api_key,
@@ -107,6 +105,13 @@ class UserConfigurationValidator:
             return []  # Optional service not configured is OK
 
         provider = service_config.provider
+
+        # Piper runs in-process: no API key, no endpoint, nothing to reach.
+        # Without this early return it falls through to _check_api_key, which
+        # returns False for any provider absent from _validator_map and would
+        # report the default TTS as invalid.
+        if provider == ServiceProviders.PIPER.value:
+            return []
 
         # Speaches doesn't require an API key
         if provider == ServiceProviders.SPEACHES.value:
@@ -235,18 +240,6 @@ class UserConfigurationValidator:
     def _check_cartesia_api_key(self, model: str, api_key: str) -> bool:
         return True
 
-    def _check_dograh_api_key(self, model: str, api_key: str) -> bool:
-        if api_key.startswith("dgr"):
-            raise ValueError(
-                "You provided a Dograh API key (dgr...) instead of a service key. "
-                "Please use a service key (mps...)."
-            )
-        auth = getattr(self, "_auth_context", {})
-        return mps_service_key_client.validate_service_key(
-            api_key,
-            organization_id=auth.get("organization_id"),
-            created_by=auth.get("created_by"),
-        )
 
     def _check_sarvam_api_key(self, model: str, api_key: str) -> bool:
         return True

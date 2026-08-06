@@ -127,6 +127,16 @@ services:
 
   api:
     image: ${REGISTRY:-dograhai}/dograh-api:latest
+    # Build from the repo root so `COPY pipecat` (Dockerfile:44) and `COPY ./api`
+    # resolve — same context/args as `make build-api`. Lets `docker compose up
+    # -d --build` rebuild the local tree instead of pulling the registry image.
+    # Behind the corporate MITM proxy set INSECURE_BUILD=1 (in .env or inline).
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+      args:
+        INSECURE_BUILD: "${INSECURE_BUILD:-0}"
+        PIPER_VOICES: "${PIPER_VOICES:-ru_RU-irina-medium}"
     volumes:
       - shared-tmp:/tmp
     environment:

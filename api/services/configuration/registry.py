@@ -95,7 +95,11 @@ class BaseServiceConfiguration(BaseModel):
         ServiceProviders.GOOGLE_VERTEX_REALTIME,
         # ServiceProviders.SARVAM,
     ]
-    api_key: str | list[str]
+    # Optional at parse time so a partially-configured service can be saved
+    # (the seed leaves a service's key empty when its env var is unset); the
+    # None-handling below already supports it, and presence is enforced when
+    # the config is actually validated/used (check_validity.py), not on save.
+    api_key: str | list[str] | None = None
 
     @field_validator("api_key")
     @classmethod

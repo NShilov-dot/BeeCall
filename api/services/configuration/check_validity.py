@@ -1,9 +1,5 @@
 from typing import Optional, TypedDict
 
-import openai
-from deepgram import DeepgramClient
-from groq import Groq
-
 # try:
 #     from pyneuphonic import Neuphonic
 # except ImportError:
@@ -204,29 +200,21 @@ class UserConfigurationValidator:
 
         return validator(provider, api_key)
 
+    # OpenAI / Deepgram / Groq previously verified the key with a live API call
+    # (models.list / projects.list). Behind the corporate MITM proxy that call
+    # fails on cert/TLS interception even when the key is valid, so it rejected
+    # good keys at save time. Trust the key's presence here and let a real auth
+    # error surface at first call — same approach as _check_deepseek_api_key.
+    # bool(api_key) still catches the common "forgot to paste a key" case
+    # offline, without a network round-trip.
     def _check_openai_api_key(self, model: str, api_key: str) -> bool:
-        client = openai.OpenAI(api_key=api_key)
-        try:
-            client.models.list()
-            return True
-        except openai.AuthenticationError:
-            return False
+        return bool(api_key)
 
     def _check_deepgram_api_key(self, model: str, api_key: str) -> bool:
-        try:
-            deepgram = DeepgramClient(api_key=api_key)
-            deepgram.manage.v1.projects.list()
-            return True
-        except Exception:
-            return False
+        return bool(api_key)
 
     def _check_groq_api_key(self, model: str, api_key: str) -> bool:
-        client = Groq(api_key=api_key)
-        try:
-            client.models.list()
-            return True
-        except Exception:
-            return False
+        return bool(api_key)
 
     def _validate_elevenlabs_api_key(self, model: str, api_key: str) -> bool:
         return True

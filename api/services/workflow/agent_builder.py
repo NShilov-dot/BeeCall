@@ -32,6 +32,15 @@ _NON_OPENAI_PROVIDERS = {
     ServiceProviders.AWS_BEDROCK.value,
 }
 
+# Self-hosted gateways that authenticate by network policy (mTLS / VPC), not by
+# a bearer token — they legitimately run without an API key. Every other
+# provider points at a public managed endpoint that verifies the token, so a
+# missing key there can only 401; see build_workflow_from_description.
+_KEYLESS_GATEWAY_PROVIDERS = {
+    ServiceProviders.BEECALL.value,
+    ServiceProviders.SPEACHES.value,
+}
+
 _SYSTEM_PROMPT = """You write prompts for voice AI agents that talk to humans over the phone.
 
 Return ONLY a JSON object with the keys "name", "greeting" and "prompt":
@@ -113,9 +122,21 @@ async def build_workflow_from_description(
             "another OpenAI-compatible provider to generate agents."
         )
 
+    # A public managed endpoint (DeepSeek, OpenAI, ...) verifies the bearer
+    # token, so an empty key can only come back as the provider's opaque
+    # "api key is invalid" 401. Fail early with an actionable message and let
+    # the user add their key when ready, instead of sending the "unused"
+    # placeholder below. Keyless gateways skip this — the placeholder is theirs.
+    if not llm.api_key and provider not in _KEYLESS_GATEWAY_PROVIDERS:
+        raise LLMNotConfiguredError(
+            f"No API key set for the configured LLM ({provider}). Add your "
+            f"{provider} API key under Model Configurations, then use the "
+            "Agent Builder."
+        )
+
     try:
-        # Gateways that authenticate by network policy accept any bearer token,
-        # but the OpenAI client refuses to start without one.
+        # Keyless gateways accept any bearer token, but the OpenAI client
+        # refuses to start without one.
         async with AsyncOpenAI(
             api_key=llm.api_key or "unused",
             # None means the client's own default endpoint (OpenAI).

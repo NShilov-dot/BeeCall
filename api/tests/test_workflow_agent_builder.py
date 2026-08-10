@@ -123,6 +123,23 @@ async def test_missing_llm_config_raises_actionable_error():
 
 
 @pytest.mark.asyncio
+async def test_empty_api_key_fails_before_calling_deepseek():
+    """No key for a public provider → clean error, never sends "unused"."""
+    config = UserConfiguration(
+        llm=DeepSeekLLMConfiguration(api_key=None, model="deepseek-chat")
+    )
+    with _patch_config(config), _patch_llm("unused") as mock_client_cls:
+        with pytest.raises(LLMNotConfiguredError, match="Model Configurations"):
+            await build_workflow_from_description(
+                user_id=1,
+                call_type="INBOUND",
+                use_case="Поддержка",
+                activity_description="Отвечать на вопросы",
+            )
+    mock_client_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_unusable_llm_output_raises():
     with pytest.raises(AgentGenerationError):
         await _build("Sorry, I cannot help with that.")

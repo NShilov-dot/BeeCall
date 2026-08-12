@@ -146,6 +146,7 @@
             "group": "Deployment",
             "pages": [
               "deployment/introduction",
+              "deployment/vps-beecall",
               "deployment/docker",
               "deployment/custom-domain",
               "deployment/scaling",

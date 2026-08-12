@@ -1,6 +1,7 @@
 services:
   postgres:
     image: pgvector/pgvector:pg17
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -27,6 +28,7 @@ services:
 
   redis:
     image: redis:7
+    restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379" # loopback only — never expose Redis off-host
     command: >
@@ -44,6 +46,7 @@ services:
   minio:
     image: minio/minio
     container_name: minio
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -88,6 +91,7 @@ services:
   nginx:
     image: nginx:alpine
     container_name: nginx_https
+    restart: unless-stopped
     profiles: ["remote"]
     depends_on:
       dograh-init:
@@ -126,7 +130,14 @@ services:
       - app-network
 
   api:
-    image: ${REGISTRY:-dograhai}/dograh-api:latest
+    # Default registry is deliberately a local-only name: this fork's code exists
+    # ONLY in images built here. If a stray `--pull always` (e.g. `remote_up.sh`
+    # without `--build`) tries to fetch it, we want a loud "not found" rather
+    # than a silent deploy of upstream Dograh images missing the BeeCall
+    # services. Always start the remote stack with `./remote_up.sh --build`.
+    image: ${REGISTRY:-beecall-local}/dograh-api:latest
+    pull_policy: never
+    restart: unless-stopped
     # Build from the repo root so `COPY pipecat` (Dockerfile:44) and `COPY ./api`
     # resolve — same context/args as `make build-api`. Lets `docker compose up
     # -d --build` rebuild the local tree instead of pulling the registry image.
@@ -173,6 +184,10 @@ services:
       # from this value and nginx load-balances across them with least_conn.
       FASTAPI_WORKERS: "${FASTAPI_WORKERS:-1}"
 
+      # Number of arq background-job processes. Raise it if the job queue backs
+      # up; nginx is not involved, so no config regeneration is needed.
+      ARQ_WORKERS: "${ARQ_WORKERS:-1}"
+
       # Langfuse — credentials can be set here or per-organization via the UI
       # at /settings. Tracing is automatically active when credentials are
       # available; uncomment to set defaults for all organizations.
@@ -204,7 +219,11 @@ services:
       POSTHOG_HOST: "https://us.i.posthog.com"
 
     ports:
-      - "8000:8000"
+      # loopback only — nginx load-balances across api:8000..api:8000+N-1 over
+      # app-network, so publishing off-host would only expose the API without
+      # TLS. Docker's iptables rules bypass ufw, so this must be closed here
+      # rather than in the host firewall.
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -226,7 +245,20 @@ services:
       - app-network
 
   ui:
-    image: ${REGISTRY:-dograhai}/dograh-ui:latest
+    # Same local-only default as api — see the comment there.
+    image: ${REGISTRY:-beecall-local}/dograh-ui:latest
+    pull_policy: never
+    restart: unless-stopped
+    # Build context is the repo root, matching `make build-ui` (ui/Dockerfile
+    # does `COPY ui/...`). Without this block `--build` would rebuild api but
+    # leave ui pulling a registry image, shipping a frontend without this
+    # fork's code. INSECURE_BUILD is declared explicitly: unlike api, ui has no
+    # other place to inherit it from.
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+      args:
+        INSECURE_BUILD: "${INSECURE_BUILD:-0}"
     environment:
       # Bind the Next.js standalone server to all interfaces. Docker otherwise
       # injects HOSTNAME=<container id> and Next binds only to that interface,
@@ -243,7 +275,8 @@ services:
       POSTHOG_KEY: "phc_ItizB1dP6yv7ZYobbcqrpxTdbomDA8hJFSEmAMdYvIr"
       POSTHOG_HOST: "https://us.posthog.com"
     ports:
-      - "3010:3010"
+      # loopback only — nginx proxies `/` to ui:3010 over app-network.
+      - "127.0.0.1:3010:3010"
     depends_on:
       api:
         condition: service_healthy

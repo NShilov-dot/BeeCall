@@ -1,0 +1,452 @@
+---
+title: "Деплой BeeCall на VPS"
+description: "Полная инструкция: подготовка Ubuntu-сервера, сборка из исходников форка, HTTPS-домен с Let's Encrypt, проверка и эксплуатация"
+---
+
+Это рабочая инструкция для развёртывания **BeeCall** — форка Dograh — на отдельном VPS с публичным IP,
+своим доменом и сертификатом Let's Encrypt. В отличие от [Docker](/deployment/docker), где стек
+поднимается из готовых образов upstream, здесь всё собирается из исходников этого репозитория.
+
+<Warning>
+**Готовые образы upstream вам не подойдут.** В `ghcr.io/dograh-hq` и `dograhai/*` нет кода BeeCall:
+DeepSeek LLM, GigaAM STT, XAI TTS, русского голоса Piper, конфигов телефонии Beeline и правок реестра
+провайдеров. Поэтому стек всегда запускается через `./remote_up.sh --build`, а `image:` в
+`docker-compose.yaml` по умолчанию указывает на локальный реестр `beecall-local`, которого не существует
+в сети — случайный `--pull` упадёт с явной ошибкой вместо тихого деплоя чужого кода.
+</Warning>
+
+## Что получится
+
+`https://<ваш-домен>` с доверенным сертификатом и автопродлением, автозапуск стека после перезагрузки
+сервера, закрытый firewall и агент, который отвечает голосом в браузере.
+
+## Требования
+
+- **VPS**: официальный минимум — 4 vCPU и 8 GB RAM. Рекомендуем **4–8 vCPU / 16 GB RAM / 60 GB SSD**:
+  сборка Next.js запрашивает 4 GB heap, каждый uvicorn-воркер занимает 300–500 MB, образ `api` крупный
+  (pipecat со всеми extras, статический ffmpeg, бинарь Node 22, голоса Piper по ~63 MB).
+- **GPU не нужен** — `torch` в образ `api` не входит. GPU требуется только для отдельного
+  [GigaAM STT](#локальный-stt-gigaam-на-будущее).
+- **Ubuntu 22.04 или 24.04** на чистом сервере — так меньше конфликтов по портам и зависимостям.
+- **Публичный IPv4** и домен, которым вы управляете.
+
+### Порты
+
+Открыть и в security group облачного провайдера, и в `ufw`:
+
+| Порт | Протокол | Зачем |
+|------|----------|-------|
+| 22 | TCP | SSH — ограничьте своими адресами |
+| 80 | TCP | Редирект на HTTPS и ACME-челлендж Let's Encrypt |
+| 443 | TCP | HTTPS: UI, REST, WebSocket с аудио, `/voice-audio/` |
+| 3478 | TCP + UDP | STUN/TURN |
+| 5349 | TCP + UDP | TURN over TLS |
+| 49152–49200 | UDP | TURN relay — медиапоток |
+
+Наружу **не** открывайте 8000, 3010, 5432, 6379, 9000 и 9001: в `docker-compose.yaml` они уже
+привязаны к `127.0.0.1`.
+
+<Warning>
+Docker пишет свои правила в цепочки `DOCKER` и `DOCKER-USER`, **обходя `ufw`**. Опубликованный
+контейнером порт правилом `ufw deny` не закрывается — закрывать нужно привязкой к loopback в
+`docker-compose.yaml`. Если вы меняли секции `ports`, проверьте результат сканированием с внешней машины
+(команда в разделе [Проверка](#проверка)).
+</Warning>
+
+### Сетевые доступы
+
+**На время сборки** нужен доступ к `registry-1.docker.io` и `auth.docker.io`, `pypi.org`,
+`files.pythonhosted.org`, `registry.npmjs.org`, `huggingface.co` (голоса Piper),
+`raw.githubusercontent.com` (данные NLTK) и `github.com`.
+
+**В рантайме** — `acme-v02.api.letsencrypt.org` (выпуск и продление сертификата),
+`stun.l.google.com:19302` (адрес STUN зашит в коде сигналинга), `services.dograh.com` (страница
+API-ключей обращается к хостовому сервису даже в OSS-режиме) и endpoints выбранных вами провайдеров.
+Телеметрию PostHog отключаем через `ENABLE_TELEMETRY=false`.
+
+<Note>
+**За корпоративным MITM-прокси** сборке понадобится `INSECURE_BUILD=1`: это ослабляет проверку TLS для
+pip, npm и urllib **только на этапе сборки**, рантайм остаётся с обычными настройками. Демону Docker
+прокси задаётся отдельно, в `/etc/systemd/system/docker.service.d/http-proxy.conf`.
+</Note>
+
+## Шаг 1. DNS
+
+Создайте A-запись, указывающую на публичный IP сервера, и дождитесь распространения:
+
+```bash
+dig +short voice.example.uz
+```
+
+В ответе должен быть IP вашего сервера. Дальше не двигайтесь: Let's Encrypt проверяет владение доменом
+именно через него.
+
+## Шаг 2. Подготовка сервера
+
+<Steps>
+<Step title="Обновите систему и поставьте базовые пакеты">
+```bash
+sudo apt update && sudo apt full-upgrade -y
+sudo apt install -y curl git ca-certificates openssl dnsutils ufw
+```
+</Step>
+
+<Step title="Создайте пользователя для деплоя и закройте SSH">
+Работайте не под root. В `/etc/ssh/sshd_config` выставьте `PasswordAuthentication no` и
+`PermitRootLogin no`, затем `sudo systemctl reload ssh`. Убедитесь, что вход по ключу работает,
+**прежде** чем закрывать пароли.
+</Step>
+
+<Step title="Установите Docker Engine и Compose v2">
+Только из официального репозитория Docker — в пакете `docker.io` из Ubuntu нет `docker compose`.
+Следуйте [инструкции Docker для Ubuntu](https://docs.docker.com/engine/install/ubuntu/), затем
+проверьте:
+
+```bash
+docker compose version   # должно быть v2.x
+```
+
+Добавьте себя в группу `docker` и перелогиньтесь:
+
+```bash
+sudo usermod -aG docker $USER
+```
+</Step>
+
+<Step title="Настройте firewall">
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow from <ваш-IP> to any port 22 proto tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 3478
+sudo ufw allow 5349
+sudo ufw allow 49152:49200/udp
+sudo ufw enable
+```
+</Step>
+
+<Step title="Добавьте swap и ограничьте логи">
+Swap на 2–4 GB страхует от OOM при сборке Next.js. Глобальный лимит логов задаётся в
+`/etc/docker/daemon.json` (в compose он выставлен только для postgres и redis):
+
+```json
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+```
+
+После правки — `sudo systemctl restart docker`.
+</Step>
+</Steps>
+
+## Шаг 3. Клонирование
+
+Клонируйте репозиторий в каталог с именем `dograh`. Это не косметика:
+`scripts/setup_custom_domain.sh` проверяет наличие подкаталога `dograh/` и прописывает этот путь в
+hook автопродления сертификата.
+
+```bash
+sudo mkdir -p /opt/beecall && sudo chown $USER:$USER /opt/beecall
+cd /opt/beecall
+git clone https://github.com/NShilov-dot/BeeCall.git dograh
+cd dograh
+```
+
+<Note>
+`pipecat` в этом форке вендорен в репозиторий, а не подключён как submodule, поэтому
+`git submodule update --init --recursive` из upstream-документации здесь не нужен — обычного `clone`
+достаточно.
+</Note>
+
+## Шаг 4. Первичная конфигурация
+
+Запустите из корня репозитория:
+
+```bash
+DEPLOY_MODE=prebuilt DOGRAH_SKIP_DOWNLOAD=1 \
+SERVER_IP=<публичный IPv4> \
+FASTAPI_WORKERS=4 \
+ENABLE_TELEMETRY=false \
+  ./scripts/setup_remote.sh
+```
+
+Скрипт создаст `.env` (сгенерировав `OSS_JWT_SECRET` и `TURN_SECRET`), self-signed сертификат в
+`certs/` и `generate_certificate.sh`, после чего проверит, что конфигурация целостна.
+
+Про два флага:
+
+- `DOGRAH_SKIP_DOWNLOAD=1` не даёт скрипту скачать upstream-овый `docker-compose.yaml` и затереть
+  правки форка.
+- `DEPLOY_MODE=prebuilt` отключает генерацию `docker-compose.override.yaml`: сборка уже описана прямо
+  в `docker-compose.yaml`. Несмотря на название режима, собираться всё будет локально — за счёт
+  секций `build:` и флага `--build`.
+
+`FASTAPI_WORKERS` берите примерно по одному на vCPU, максимум 8 — подробнее в
+[Scaling](/deployment/scaling).
+
+### Пропишите домен в `.env`
+
+Сделайте это сразу, чтобы не переезжать потом с IP на домен:
+
+```bash
+PUBLIC_HOST=voice.example.uz
+PUBLIC_BASE_URL=https://voice.example.uz
+```
+
+Остальные производные значения `remote_up.sh` выставит сам при каждом запуске: он приводит `.env` к
+инварианту `BACKEND_API_ENDPOINT` = `PUBLIC_BASE_URL` = `MINIO_PUBLIC_ENDPOINT` и
+`TURN_HOST` = `PUBLIC_HOST`.
+
+Итоговый минимум в `.env`:
+
+```bash
+ENVIRONMENT=production
+SERVER_IP=203.0.113.50
+PUBLIC_HOST=voice.example.uz
+PUBLIC_BASE_URL=https://voice.example.uz
+BACKEND_API_ENDPOINT=https://voice.example.uz
+MINIO_PUBLIC_ENDPOINT=https://voice.example.uz
+TURN_HOST=voice.example.uz
+TURN_SECRET=<сгенерирован скриптом>
+FORCE_TURN_RELAY=false
+OSS_JWT_SECRET=<сгенерирован скриптом>
+FASTAPI_WORKERS=4
+ENABLE_TELEMETRY=false
+```
+
+Ключи провайдеров сюда добавлять не обязательно — их можно прописать в UI после запуска. Если
+добавите `DEEPSEEK_API_KEY`, `DEEPGRAM_API_KEY` или `OPENAI_API_KEY`, они попадут в стек по умолчанию
+для новых пользователей.
+
+## Шаг 5. Сборка и запуск
+
+```bash
+./remote_up.sh --preflight-only   # проверка конфигурации, ничего не запускает
+./remote_up.sh --build
+```
+
+<Warning>
+Флаг `--build` нужен **при каждом** запуске. Без него `remote_up.sh` выполняет
+`docker compose up --pull always` и пытается стянуть образы из реестра, которого нет.
+</Warning>
+
+Первая сборка идёт долго: для `api` устанавливается pipecat со всеми extras, ffmpeg, Node и голоса
+Piper, для `ui` выполняется полная сборка Next.js. Повторные запуски быстрые за счёт кэша слоёв.
+
+Поднимется профиль `remote`: одноразовый `dograh-init` рендерит конфиги nginx и coturn в named
+volumes, затем стартуют `postgres`, `redis`, `minio`, `api` (по healthcheck), `ui`, `nginx` и `coturn`.
+
+<Note>
+Миграции БД запускать отдельно не нужно. Контейнер `api` сам выполняет `alembic upgrade head` при
+каждом старте, до запуска воркеров.
+</Note>
+
+На этом этапе стек уже доступен по `https://<домен>`, но с самоподписанным сертификатом — браузер
+покажет предупреждение. Это нормально, дальше меняем сертификат на настоящий.
+
+## Шаг 6. Домен и Let's Encrypt
+
+Запускайте **из `/opt/beecall`**, а не из `dograh/`:
+
+```bash
+cd /opt/beecall
+sudo ./dograh/scripts/setup_custom_domain.sh
+```
+
+Скрипт спросит домен и e-mail, затем сам проверит DNS, установит certbot, остановит стек (чтобы
+освободить порт 80), выпустит сертификат через `certbot certonly --standalone`, положит его в
+`dograh/certs/`, обновит `.env`, создаст hook автопродления и прогонит `certbot renew --dry-run`.
+
+<Warning>
+**Ожидаемая особенность на форке.** Последним шагом скрипт вызывает `./remote_up.sh` без `--build`,
+то есть в режиме `--pull always` — с локальным реестром это упадёт. Ничего не потеряно: сертификат,
+`.env` и hook уже установлены. Просто добейте вручную:
+
+```bash
+cd /opt/beecall/dograh && ./remote_up.sh --build
+```
+</Warning>
+
+Сам hook автопродления безопасен — он делает `docker compose --profile remote restart nginx`, без pull.
+
+<Warning>
+После этого шага **не переносите каталог `dograh/`**: его путь зашит в hook автопродления
+`/etc/letsencrypt/renewal-hooks/deploy/dograh-reload.sh`.
+</Warning>
+
+Если предпочитаете обойтись без скрипта, полностью ручной путь описан в
+[Custom Domain](/deployment/custom-domain).
+
+## Шаг 7. Первичная настройка в UI
+
+<Steps>
+<Step title="Зарегистрируйте первого пользователя">
+Откройте `https://<домен>` и создайте аккаунт. Аутентификация локальная — email и пароль, bcrypt и
+JWT HS256; единственный секрет — `OSS_JWT_SECRET`. Ничего вроде внешнего провайдера входа настраивать
+не нужно. Регистрация сразу создаёт организацию и заполняет стек по умолчанию.
+</Step>
+
+<Step title="Заполните Model Configurations">
+TTS уже работает: Piper запускается внутри процесса `api`, русский голос `ru_RU-irina-medium` вшит в
+образ и ключа не требует. Заполнить нужно **LLM и STT** — без них агент не проходит валидацию.
+Embeddings опциональны.
+
+Доступны `openai`, `deepseek`, `deepgram`, `groq`, `openrouter`, `cartesia`, `elevenlabs`, `google`,
+`google_vertex`, `azure`, `aws_bedrock`, `sarvam`, `speechmatics`, `camb`, `assemblyai`, `gladia`,
+`rime`, `minimax`, `speaches`, `piper`, `beecall` и realtime-варианты. Провайдер `beecall` указывает
+на внутренний шлюз `https://llm.beecall.internal/v1` — если пойдёте этим путём, проверьте его
+достижимость с VPS.
+
+Валидация ключей проверяет только заполненность полей и не делает вызовов к провайдеру.
+</Step>
+
+<Step title="Создайте агента и позвоните из браузера">
+Микрофон браузер отдаёт только на HTTPS, поэтому проверка имеет смысл именно после Шага 6.
+</Step>
+</Steps>
+
+## Проверка
+
+```bash
+cd /opt/beecall/dograh
+
+# Все контейнеры up, api и ui — healthy, dograh-init — exited(0)
+docker compose --profile remote ps
+
+# Образы локальные, а не из реестра
+docker compose --profile remote images          # ожидаем beecall-local/...
+
+# Миграции прошли, воркеры поднялись
+docker compose --profile remote logs api | grep -E "Uvicorn running|alembic|ERROR"
+docker compose --profile remote top api | grep -c uvicorn     # == FASTAPI_WORKERS
+
+# API через nginx и валидный TLS
+curl -sS https://<домен>/api/v1/health
+curl -sSI http://<домен>/                       # 301 на https
+
+# nginx собран под нужный домен и число воркеров
+docker compose --profile remote exec nginx head -20 /etc/nginx/conf.d/default.conf
+
+# TURN отвечает
+nc -vzu <домен> 3478
+```
+
+С **другой** машины убедитесь, что наружу не торчит лишнее — открытыми должны быть только 22, 80 и 443:
+
+```bash
+nmap -Pn -p 22,80,443,3010,8000,5432,6379,9000,9001 <домен>
+```
+
+Дополнительно стоит проверить:
+
+- **Скачивание записи или транскрипта звонка** из UI — это путь `/voice-audio/` через nginx в MinIO.
+  Он ломается, если `MINIO_PUBLIC_ENDPOINT` не совпадает с `PUBLIC_BASE_URL`.
+- **Перезагрузку сервера** — стек должен подняться сам, без ручного вмешательства.
+
+<Note>
+Если звонок соединяется, но звука нет ни в одну сторону, выставьте `FORCE_TURN_RELAY=true` в `.env`,
+перезапустите стек и смотрите ICE в консоли браузера. В этом режиме используются только relay-кандидаты,
+поэтому проблемы TURN падают явно, а не маскируются прямым P2P-соединением. После проверки верните
+`false`.
+</Note>
+
+## Эксплуатация
+
+### Обновление кода
+
+Только через git — `scripts/update_remote.sh` предназначен для установок с готовыми образами upstream
+и здесь не подходит.
+
+```bash
+cd /opt/beecall/dograh
+git pull
+./remote_up.sh --build
+```
+
+### Изменение числа воркеров
+
+Поправьте `FASTAPI_WORKERS` в `.env` и перезапустите. `dograh-init` перегенерирует upstream nginx, а
+preflight сверит, что количество совпадает:
+
+```bash
+./remote_up.sh --build                # весь стек
+./remote_up.sh --build -- api nginx   # только api и nginx
+```
+
+Число фоновых воркеров задаётся отдельно, через `ARQ_WORKERS`, и nginx не затрагивает.
+
+### Логи
+
+```bash
+docker compose --profile remote logs -f api
+make logs SERVICE=api                 # то же самое
+```
+
+### Резервное копирование
+
+Всё состояние живёт в docker volumes, поэтому бэкап обязателен:
+
+```bash
+docker compose exec -T postgres pg_dump -U postgres postgres | gzip > dump-$(date +%F).sql.gz
+```
+
+Отдельно копируйте volume `minio-data` (записи звонков) и храните `.env` вне сервера: при потере
+`OSS_JWT_SECRET` разлогинятся все пользователи, при потере `TURN_SECRET` перестанет работать
+авторизация WebRTC.
+
+### Сертификат
+
+Продлевается системным таймером certbot, hook сам копирует файлы и перезапускает nginx. Проверка:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+<Warning>
+Не запускайте `setup_remote.sh` повторно на рабочей установке — он перегенерирует `OSS_JWT_SECRET`,
+`TURN_SECRET` и сертификаты. По умолчанию скрипт сам отказывается это делать.
+</Warning>
+
+## Что стоит решить осознанно
+
+Не блокирует деплой, но лучше проверить до продакшена:
+
+- **Пароли инфраструктуры зашиты в `docker-compose.yaml`**: postgres `postgres/postgres`, redis
+  `redissecret`, minio `minioadmin/minioadmin`, плюс `MINIO_API_CORS_ALLOW_ORIGIN: "*"`. Все три
+  слушают только loopback и снаружи недоступны, но для продакшена их стоит сменить — потребуется
+  поправить `DATABASE_URL` и `REDIS_URL` в том же файле.
+- **CORS у API** — `allow_origins=["*"]`.
+- **`ui/Dockerfile`** зашивает на этапе сборки `NEXT_PUBLIC_CHATWOOT_URL` и токен Chatwoot; они
+  попадают в клиентский бандл.
+- **`config/coturn/turnserver.conf`** — легаси-файл с плейсхолдерным `static-auth-secret`. Профиль
+  `remote` его не использует (конфиг генерируется в volume), но в продакшен он попасть не должен.
+
+## Альтернатива: за внешним балансировщиком
+
+Если TLS терминируется не здесь, а на внешнем шлюзе, вместо профиля `remote` используйте профиль
+`edge` с конфигом `config/nginx/callcenter.conf`: он слушает только HTTP и делает ту же разводку по
+путям. Оба профиля занимают порт 80 — **одновременно запускать нельзя**. При этом `BACKEND_API_ENDPOINT`
+и `MINIO_PUBLIC_ENDPOINT` всё равно должны указывать на публичный `https://`-адрес.
+
+## Локальный STT GigaAM (на будущее)
+
+`scripts/gigaam_stt_server.py` — обёртка над GigaAM-Multilingual (русский и узбекский) с
+OpenAI-совместимым endpoint. В `docker-compose.yaml` она не подключена и в этот деплой не входит:
+нужен GPU и отдельная установка `torch`, `torchaudio` и `transformers`.
+
+Когда появится GPU-машина:
+
+```bash
+GIGAAM_REVISION=ctc uvicorn scripts.gigaam_stt_server:app --host 0.0.0.0 --port 8001
+```
+
+Затем в UI выберите STT-провайдера `speaches` с `base_url=http://<host>:8001/v1`, `model=gigaam` и
+`language=ru` или `uz`.
+
+<Warning>
+Порт 8001 конфликтует со вторым uvicorn-воркером `api` при `FASTAPI_WORKERS >= 2`. На одном хосте
+меняйте либо порт GigaAM, либо `UVICORN_BASE_PORT`.
+</Warning>

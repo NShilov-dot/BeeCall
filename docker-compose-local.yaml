@@ -59,7 +59,7 @@ services:
       - beecall-network
 
   api:
-    image: ${REGISTRY:-dograhai}/dograh-api:latest
+    image: ${REGISTRY:-beecall-local}/dograh-api:latest
     environment:
       ENVIRONMENT: "${ENVIRONMENT:-local}"
       LOG_LEVEL: "${LOG_LEVEL:-DEBUG}"
@@ -118,7 +118,7 @@ services:
       - beecall-network
 
   ui:
-    image: ${REGISTRY:-dograhai}/dograh-ui:latest
+    image: ${REGISTRY:-beecall-local}/dograh-ui:latest
     environment:
       # api is in this compose now — reach it via the service name.
       BACKEND_URL: "${BACKEND_URL:-http://api:8000}"

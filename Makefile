@@ -15,7 +15,10 @@
 #   All services join `beecall-network` (explicit, no project prefix), so
 #   ad-hoc containers can `--network beecall-network` to talk to the stack.
 
-REGISTRY ?= dograhai
+# Local-only default: BeeCall images are never published to a registry, and the
+# name must match the `image:` default in both compose files so `make build`
+# produces exactly the tags compose expects.
+REGISTRY ?= beecall-local
 TAG      ?= latest
 
 API_IMAGE := $(REGISTRY)/dograh-api:$(TAG)
@@ -53,12 +56,16 @@ help:
 	@echo "    build-api     Build api image only"
 	@echo "    build-ui      Build ui image only"
 	@echo ""
-	@echo "  Run — production stack:"
-	@echo "    up            Start production (api + ui + infra + nginx/turn/…)"
-	@echo "    down          Stop production"
+	@echo "  Run — prod compose, default services only (api + ui + infra):"
+	@echo "    up            Start api + ui + infra. NOT the full remote stack —"
+	@echo "                  nginx/coturn/dograh-init live behind --profile remote."
+	@echo "                  For a real deploy use ./remote_up.sh --build instead;"
+	@echo "                  see docs/deployment/vps-beecall.mdx."
+	@echo "    down          Stop them"
 	@echo "    restart       down + up"
 	@echo "    rebuild       build + restart           (refresh after code changes)"
-	@echo "    pull          Pull latest images from registry (no rebuild)"
+	@echo "    pull          Refresh third-party images only (postgres/redis/minio);"
+	@echo "                  api and ui are always built locally, never pulled."
 	@echo ""
 	@echo "  Run — local dev stack:"
 	@echo "    up-local      Start local dev (api + ui + infra)"

@@ -72,7 +72,7 @@ help:
 	@echo "    down-local    Stop local dev"
 	@echo "    restart-local down-local + up-local"
 	@echo "    rebuild-local build + restart-local     (refresh after code changes)"
-	@echo "    pull-local    Pull latest images for local stack from registry"
+	@echo "    pull-local    Refresh third-party images only; api/ui are built, not pulled"
 	@echo ""
 	@echo "  Run — Asterisk for telephony tests (opt-in, separate compose file):"
 	@echo "    build-asterisk  Build Asterisk 22 + chan_websocket from source (slow)"
@@ -112,11 +112,14 @@ build-api:
 build-ui:
 	docker build $(BUILD_ARGS) -f ui/Dockerfile -t $(UI_IMAGE) .
 
+# --build on both: api/ui images are never pulled (pull_policy: never), so
+# without it a fresh checkout fails with "pull access denied". Docker's layer
+# cache makes the no-op case fast.
 up:
-	docker compose up -d
+	docker compose up -d --build
 
 up-local:
-	docker compose -f docker-compose-local.yaml up -d
+	docker compose -f docker-compose-local.yaml up -d --build
 
 # Asterisk stays opt-in: its image is built from source (20+ min) and it
 # publishes SIP/RTP host ports, so it has no place in the default local stack.

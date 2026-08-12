@@ -59,7 +59,16 @@ services:
       - beecall-network
 
   api:
+    # Local-only image name: this fork's code exists only in images built here,
+    # so there is nothing to pull. Same build context/args as `make build-api`.
     image: ${REGISTRY:-beecall-local}/dograh-api:latest
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+      args:
+        INSECURE_BUILD: "${INSECURE_BUILD:-0}"
+        PIPER_VOICES: "${PIPER_VOICES:-ru_RU-irina-medium}"
     environment:
       ENVIRONMENT: "${ENVIRONMENT:-local}"
       LOG_LEVEL: "${LOG_LEVEL:-DEBUG}"
@@ -119,6 +128,12 @@ services:
 
   ui:
     image: ${REGISTRY:-beecall-local}/dograh-ui:latest
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+      args:
+        INSECURE_BUILD: "${INSECURE_BUILD:-0}"
     environment:
       # api is in this compose now — reach it via the service name.
       BACKEND_URL: "${BACKEND_URL:-http://api:8000}"

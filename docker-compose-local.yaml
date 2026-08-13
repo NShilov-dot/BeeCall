@@ -135,6 +135,11 @@ services:
       args:
         INSECURE_BUILD: "${INSECURE_BUILD:-0}"
     environment:
+      # Bind the Next.js standalone server to all interfaces. Docker otherwise
+      # injects HOSTNAME=<container id> and Next binds only to that interface,
+      # so the loopback healthcheck below fails ("unhealthy") even though the
+      # published port works. Must match docker-compose.yaml.
+      HOSTNAME: "0.0.0.0"
       # api is in this compose now — reach it via the service name.
       BACKEND_URL: "${BACKEND_URL:-http://api:8000}"
       NODE_ENV: "oss"
